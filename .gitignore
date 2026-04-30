@@ -1,0 +1,23 @@
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+.uv/
+*.egg-info/
+
+# Build
+dist/
+build/
+
+# Geometry outputs (keep test fixtures)
+*.stl
+*.3mf
+!tests/fixtures/*.stl
+*.vdb
+
+# IDE
+.vscode/
+.idea/
+
+# uv managed Python
+.python-version

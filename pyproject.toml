@@ -1,0 +1,29 @@
+[project]
+name = "picogk-mp"
+version = "0.1.0"
+description = "Voxel-based multiphysics CAD pipeline built on PicoGK/pycogk"
+readme = "README.md"
+authors = [
+    { name = "Daniel Heuberger", email = "heuberger.daniel@gmail.com" }
+]
+requires-python = ">=3.12"
+dependencies = [
+    "numpy>=2.4.4",
+    "pycogk>=0.3.0",
+    "trimesh>=4.12.1",
+    "vedo>=2026.6.1",
+]
+
+[project.scripts]
+picogk-mp = "picogk_mp:main"
+
+[build-system]
+requires = ["uv_build>=0.10.9,<0.11.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "mypy>=1.20.2",
+    "pytest>=9.0.3",
+    "ruff>=0.15.12",
+]
