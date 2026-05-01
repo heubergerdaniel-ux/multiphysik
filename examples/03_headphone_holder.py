@@ -23,10 +23,39 @@ import picogk
 from picogk import Lattice, Mesh, VedoViewer, Voxels
 
 from picogk_mp.csg import cylinder_voxels, union
+from picogk_mp.physics import Param, SimEngine, TippingCheck, StemBendingCheck
 
 OUT     = Path(__file__).parent.parent / "tests"  / "fixtures" / "headphone_holder_v2.stl"
 PREVIEW = Path(__file__).parent.parent / "docs"   / "headphone_holder_v2_preview.png"
 VOXEL   = 0.5   # mm
+
+# ------------------------------------------------------------------
+# Geometry constants (must match _build() below)
+# ------------------------------------------------------------------
+BASE_R_MM      = 48.0   # NOTE: below stable limit for 20% infill -- kept as
+                        # reference; engine will flag and print min. radius
+ARM_REACH_MM   = 82.0
+STEM_R_MIN_MM  =  7.0   # tapered stem minimum radius at top
+
+# ------------------------------------------------------------------
+# Physics engine -- head_mass_g is UNKNOWN -> user will be asked
+# ------------------------------------------------------------------
+ENGINE = (
+    SimEngine()
+    .register(
+        Param("head_mass_g",   "Kopfhoerermasse",    unit="g",     lo=50, hi=2000),
+        Param("infill_pct",    "Infill-Anteil",      unit="%",     default=20, lo=5, hi=100),
+        Param("density_g_cm3", "Filament-Dichte",    unit="g/cm3", default=1.24),
+        Param("yield_mpa",     "Streckgrenze",       unit="MPa",   default=55.0),
+        # geometry -- injected after build
+        Param("base_r_mm",     "Basisradius",        unit="mm"),
+        Param("arm_reach_mm",  "Armreichweite",      unit="mm"),
+        Param("stem_r_min_mm", "Stem-Mindestradius", unit="mm"),
+        Param("volume_mm3",    "Druckvolumen",       unit="mm3"),
+    )
+    .add_check(TippingCheck())
+    .add_check(StemBendingCheck())
+)
 
 
 def _build(viewer: VedoViewer) -> None:
@@ -78,6 +107,17 @@ def _build(viewer: VedoViewer) -> None:
     vol, _ = holder.calculate_properties()
     print(f"headphone_holder_v2.stl: {mesh.triangle_count()} tri | "
           f"{vol:.0f} mm3 | {OUT.stat().st_size // 1024} KB")
+
+    # ------------------------------------------------------------------
+    # 4b. PHYSICS CHECKS -- inject geometry, ask user for unknowns
+    # ------------------------------------------------------------------
+    ENGINE.inject(
+        base_r_mm=BASE_R_MM,
+        arm_reach_mm=ARM_REACH_MM,
+        stem_r_min_mm=STEM_R_MIN_MM,
+        volume_mm3=vol,
+    )
+    ENGINE.run(raise_on_failure=False)   # warn but don't abort viewer
 
     # ------------------------------------------------------------------
     # 5. VIEWER
