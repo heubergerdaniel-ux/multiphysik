@@ -10,6 +10,7 @@ requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.4.4",
     "pycogk>=0.3.0",
+    "scipy>=1.13",
     "trimesh>=4.12.1",
     "vedo>=2026.6.1",
 ]
