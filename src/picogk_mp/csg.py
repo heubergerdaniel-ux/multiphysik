@@ -18,6 +18,24 @@ from picogk import Mesh, Voxels
 Vector3 = Sequence[float]
 
 
+def cylinder_voxels(center: Vector3, radius: float, height: float, sections: int = 64) -> Voxels:
+    """Voxelise an upright cylinder centred at 'center' (bottom face at center[2]-height/2).
+
+    Routes through trimesh -> tmp STL -> picogk Mesh -> Voxels.
+    Fast: no offset operations, pure mesh voxelisation.
+    """
+    tm: trimesh.Trimesh = trimesh.creation.cylinder(radius=radius, height=height, sections=sections)
+    tm.apply_translation(center)
+    fd, tmp = tempfile.mkstemp(suffix=".stl")
+    os.close(fd)
+    try:
+        tm.export(tmp)
+        pmesh = Mesh.mshFromStlFile(tmp)
+    finally:
+        os.unlink(tmp)
+    return Voxels.from_mesh(pmesh)
+
+
 def box_voxels(center: Vector3, size: Vector3) -> Voxels:
     """Voxelise an axis-aligned box.
 
