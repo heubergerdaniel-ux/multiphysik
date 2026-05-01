@@ -9,7 +9,10 @@ authors = [
 requires-python = ">=3.12"
 dependencies = [
     "numpy>=2.4.4",
+    "pyamg>=5.3.0",
     "pycogk>=0.3.0",
+    "rtree>=1.4.1",
+    "scikit-image>=0.26.0",
     "scipy>=1.13",
     "trimesh>=4.12.1",
     "vedo>=2026.6.1",

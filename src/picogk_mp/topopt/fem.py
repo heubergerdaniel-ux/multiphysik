@@ -23,8 +23,8 @@ from functools import lru_cache
 from typing import Tuple
 
 import numpy as np
-from scipy.sparse import coo_matrix, eye
-from scipy.sparse.linalg import spsolve
+from scipy.sparse import coo_matrix, diags, eye
+from scipy.sparse.linalg import cg, LinearOperator, spilu, spsolve
 
 # ---------------------------------------------------------------------------
 # Isoparametric node coordinates for Hex8 in [-1,+1]^3
@@ -165,25 +165,6 @@ def assemble_K(
     return K
 
 
-def apply_bcs(
-    K: "scipy.sparse.csr_matrix",
-    f: np.ndarray,
-    fixed_dofs: np.ndarray,
-) -> Tuple["scipy.sparse.csr_matrix", np.ndarray, np.ndarray]:
-    """Eliminate fixed DOFs from K and f (penalty / elimination method).
-
-    Returns (K_free, f_free, free_dofs) where free_dofs lists the active DOFs.
-    """
-    ndof = K.shape[0]
-    all_dofs  = np.arange(ndof)
-    fixed_set = set(fixed_dofs.tolist())
-    free_dofs = np.array([d for d in all_dofs if d not in fixed_set], dtype=np.int64)
-
-    K_free = K[np.ix_(free_dofs, free_dofs)]
-    f_free = f[free_dofs]
-    return K_free, f_free, free_dofs
-
-
 def fem_solve(
     mask: np.ndarray,
     edofs: np.ndarray,
@@ -194,19 +175,177 @@ def fem_solve(
 ) -> np.ndarray:
     """Assemble, apply BCs, and solve K*u = f.
 
+    DOF compression: only DOFs that belong to at least one solid element
+    are included in the linear system.  This is critical for BESO on sparse
+    geometries where solid elements are a small fraction of the grid.
+
+    Force snapping: if a loaded DOF is not connected to any solid element
+    (e.g. because the arm tip voxel falls outside the voxelised mask at
+    coarse resolution), the load is transferred to the nearest DOF in the
+    active set so the force is always applied.
+
+    Solver: conjugate gradient with diagonal (Jacobi) preconditioner.
+    CG avoids the SuperLU fill-in memory explosions that plague spsolve on
+    near-singular systems and is fast enough for ~25K DOF FEM systems.
+
     Returns
     -------
-    u : (ndof,) displacement vector (zero at fixed DOFs)
+    u : (ndof,) displacement vector (zero at fixed and void-only DOFs)
     """
-    K = assemble_K(mask, edofs, KE, E_min=E_min)
-    K_free, f_free, free_dofs = apply_bcs(K, force_vec, fixed_dofs)
+    ndof = 3 * np.prod([s + 1 for s in mask.shape])
 
-    # Solve -- spsolve uses UMFPACK or SuperLU depending on SciPy build
-    u_free = spsolve(K_free.tocsc(), f_free)
+    # --- 1. Find active DOFs (connected to >=1 solid element or fixed) ---
+    solid = mask.ravel()
+    if np.any(solid):
+        active = np.unique(edofs[solid].ravel())
+    else:
+        return np.zeros(ndof)
 
-    ndof = K.shape[0]
+    # Include only fixed DOFs that are connected to at least one solid element.
+    # Orphaned fixed DOFs (within the BC region but not touching any solid element
+    # -- e.g. at the voxel-grid boundary of the base circle) add isolated rows
+    # with only E_min on the diagonal, which breaks AMG and degrades CG.
+    solid_connected = set(active.tolist())
+    valid_fixed = fixed_dofs[np.isin(fixed_dofs, list(solid_connected))]
+    active = np.unique(np.concatenate([active, valid_fixed]))
+
+    # --- 2. Snap force DOFs that are not in active to nearest active DOF ---
+    #   This handles the case where the load point (arm tip) falls outside the
+    #   voxelised domain at coarse topopt resolution.
+    #   Use physical (grid-coordinate) distance, not DOF-index distance,
+    #   so the force stays near the intended application point.
+    force_vec = force_vec.copy()
+    loaded_global = np.flatnonzero(force_vec)
+    if len(loaded_global) > 0:
+        Nx_s, Ny_s, Nz_s = mask.shape
+        stride_y = Nx_s + 1
+        stride_z = (Nx_s + 1) * (Ny_s + 1)
+        active_set = set(active.tolist())
+        for fd in loaded_global:
+            if fd not in active_set:
+                axis_fd   = int(fd % 3)
+                node_fd   = int(fd // 3)
+                iz_fd     = node_fd // stride_z
+                rem_fd    = node_fd % stride_z
+                iy_fd     = rem_fd  // stride_y
+                ix_fd     = rem_fd  % stride_y
+
+                # Candidate: active DOFs on the same displacement axis
+                same_axis = active[active % 3 == axis_fd]
+                if len(same_axis) > 0:
+                    nodes_sa  = same_axis // 3
+                    iz_sa     = nodes_sa // stride_z
+                    rem_sa    = nodes_sa % stride_z
+                    iy_sa     = rem_sa // stride_y
+                    ix_sa     = rem_sa % stride_y
+                    dist2 = ((ix_sa - ix_fd)**2
+                             + (iy_sa - iy_fd)**2
+                             + (iz_sa - iz_fd)**2)
+                    nearest = same_axis[int(np.argmin(dist2))]
+                else:
+                    nearest = active[int(np.argmin(np.abs(active - fd)))]
+                force_vec[nearest] += force_vec[fd]
+                force_vec[fd] = 0.0
+                n_near = int(nearest // 3)
+                iz_n = n_near // stride_z
+                rem_n = n_near % stride_z
+                iy_n = rem_n // stride_y
+                ix_n = rem_n % stride_y
+                print(f"  [FEM] Force DOF {fd} (ix={ix_fd},iy={iy_fd},iz={iz_fd}) "
+                      f"snapped to DOF {nearest} (ix={ix_n},iy={iy_n},iz={iz_n})")
+
+    # --- 3. Build compressed index map: global DOF -> compressed index ---
+    compress = np.full(ndof, -1, dtype=np.int64)
+    compress[active] = np.arange(len(active), dtype=np.int64)
+
+    n_active = len(active)
+
+    # --- 4. Assemble compressed K from solid elements only ---
+    es   = edofs[solid]                                  # (Ns, 24)
+    es_c = compress[es]                                  # compressed indices
+
+    rows = np.tile(es_c[:, :, None], (1, 1, 24)).ravel()
+    cols = np.tile(es_c[:, None, :], (1, 24, 1)).ravel()
+    data = np.tile(KE[None, :, :], (es_c.shape[0], 1, 1)).ravel()
+
+    K_c = coo_matrix((data, (rows, cols)),
+                     shape=(n_active, n_active)).tocsr()
+    # Small diagonal for numerical stability (covers fixed DOFs etc.)
+    K_c += E_min * eye(n_active, format="csr")
+
+    # --- 5. Build compressed force vector ---
+    f_c = force_vec[active]
+
+    # --- 6. Eliminate fixed DOFs from the compressed system ---
+    fixed_c = compress[fixed_dofs]
+    fixed_c = fixed_c[fixed_c >= 0]                      # only those in active
+    free_mask = np.ones(n_active, dtype=bool)
+    free_mask[fixed_c] = False
+    free_idx = np.where(free_mask)[0]
+
+    K_free = K_c[np.ix_(free_idx, free_idx)]
+    f_free = f_c[free_idx]
+
+    # --- 7. Solve: AMG-preconditioned CG, with direct-solver fallback ---
+    #   Strategy (in order of preference):
+    #   a) Smoothed-aggregation AMG (PyAMG) + CG  -- O(10-50) iters, fast
+    #   b) If CG diverges: SuperLU direct solver   -- exact, handles ill-cond.
+    #      The compressed system is O(15-25K DOFs) which SuperLU handles in
+    #      memory without issue (the earlier crash was on the *uncompressed*
+    #      430K-DOF system).
+    #   c) If spsolve also fails: Jacobi-CG best-effort (warns user).
+    u_c = np.zeros(n_active)
+    if len(free_idx) > 0:
+        K_csc = K_free.tocsc()
+
+        # Build preconditioner
+        try:
+            import pyamg
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ml = pyamg.smoothed_aggregation_solver(
+                    K_csc,
+                    B=np.ones((K_free.shape[0], 1)),   # near-null: constant
+                )
+            M = ml.aspreconditioner(cycle="V")
+        except Exception:
+            try:
+                ilu = spilu(K_csc, drop_tol=1e-4, fill_factor=20)
+                M = LinearOperator(K_free.shape, ilu.solve)
+            except (MemoryError, RuntimeError):
+                diag_vals = K_free.diagonal()
+                diag_vals = np.where(np.abs(diag_vals) < 1e-30, 1.0, diag_vals)
+                M = diags(1.0 / diag_vals)
+
+        u_free, info = cg(K_csc, f_free, M=M, rtol=1e-6, maxiter=2000)
+
+        if info != 0:
+            # CG failed -- fall back to direct solver (SuperLU).
+            # The compressed system is small enough (~15-25K DOFs) that
+            # SuperLU fill-in is well within RAM even for sparse geometries.
+            if info > 0:
+                print(f"  [FEM] CG did not converge ({info} iters) "
+                      "-- direct solver fallback")
+            else:
+                print(f"  [FEM] CG breakdown (info={info}) "
+                      "-- direct solver fallback")
+            try:
+                u_free = spsolve(K_csc, f_free)
+                if not np.all(np.isfinite(u_free)):
+                    raise RuntimeError("spsolve produced non-finite values")
+                print(f"  [FEM] Direct solve OK "
+                      f"({K_csc.shape[0]:,} DOFs)")
+            except Exception as e_direct:
+                print(f"  [FEM] Direct solver also failed ({e_direct}) "
+                      "-- result approximate")
+                # u_free already holds the last CG iterate; keep it.
+
+        u_c[free_idx] = u_free
+
+    # --- 8. Map back to full DOF vector ---
     u = np.zeros(ndof)
-    u[free_dofs] = u_free
+    u[active] = u_c
     return u
 
 

@@ -43,11 +43,19 @@ def _neighbour_filter(
     ----------
     alpha    : (Nx, Ny, Nz) raw sensitivity
     mask     : (Nx, Ny, Nz) bool -- solid elements
-    r_filter : radius in element lengths
+    r_filter : radius in element lengths (0 = no filter)
+
+    Notes
+    -----
+    The filter is skipped if its footprint would cover any entire grid
+    dimension -- on small grids that would equalise all sensitivities and
+    destroy the ranking information needed for BESO.
     """
     from scipy.ndimage import uniform_filter
-    w = uniform_filter(alpha.astype(float), size=int(np.ceil(r_filter)) * 2 + 1)
-    return w
+    size = int(np.ceil(r_filter)) * 2 + 1
+    if size <= 1 or any(size >= d for d in alpha.shape):
+        return alpha.astype(float)
+    return uniform_filter(alpha.astype(float), size=size)
 
 
 # ---------------------------------------------------------------------------
@@ -108,31 +116,46 @@ def beso_step(
         hist = hist[-2:]
     alpha_avg = np.mean(hist, axis=0)           # (Nx, Ny, Nz)
 
-    # 4. Determine target volume for THIS iteration (step toward vol_target)
-    vol_current = state.volume_fraction
-    vol_step    = max(vol_target, vol_current - er)  # remove at most er per step
+    # 4. ESO removal step: rank ONLY current solid elements by sensitivity,
+    #    remove the weakest ones until the target count is reached.
+    #
+    #    We do NOT add void elements back (no bidirectional addition) because:
+    #    a) void-element virtual sensitivities near force/BC nodes are
+    #       inflated by the E_min regularisation, causing non-physical additions;
+    #    b) we start from the full holder geometry which already has the right
+    #       topology -- we only need to remove underloaded material.
+    n_total   = Nx * Ny * Nz
+    n_goal    = max(1, int(round(vol_target * n_total)))
 
-    n_total  = Nx * Ny * Nz
-    n_target = max(1, int(round(vol_step * n_total)))
+    alpha_flat   = alpha_avg.ravel()
+    solid_flat   = state.mask.ravel()
+    solid_idx    = np.where(solid_flat)[0]       # indices of current solid els
+    n_current    = len(solid_idx)
 
-    # 5. Rank all elements by averaged sensitivity
-    alpha_flat = alpha_avg.ravel()
-    rank       = np.argsort(alpha_flat)[::-1]      # highest first
+    # Rate-limit: change at most er * n_total elements per step
+    max_remove = max(1, int(round(er * n_total)))
+    n_remove   = int(np.clip(n_current - n_goal, 0, max_remove))
+
+    # 5. Rank solid elements only; keep the top (n_current - n_remove)
+    solid_alpha = alpha_flat[solid_idx]
+    rank_solid  = np.argsort(solid_alpha)[::-1]   # highest sensitivity first
+    n_keep      = n_current - n_remove
+    keep_idx    = solid_idx[rank_solid[:n_keep]]   # top-n_keep solid elements
 
     # 6. Build new mask
     new_mask_flat = np.zeros(n_total, dtype=bool)
-    new_mask_flat[rank[:n_target]] = True          # top-n_target elements are solid
-
-    # 7. Bidirectional addition: re-add void elements with very high sensitivity
-    #    (prevents permanently removing elements that become load-critical)
-    alpha_max = alpha_flat.max()
-    admissible = alpha_flat > add_ratio * alpha_max
-    new_mask_flat[admissible] = True               # always include high-sensitivity
-
+    new_mask_flat[keep_idx] = True
     new_mask = new_mask_flat.reshape(Nx, Ny, Nz)
 
     # 8. Update state
-    compliance = float(alpha_e.sum())             # total strain energy ~ compliance
+    # Compliance = total strain energy of SOLID elements only.
+    # alpha_e has shape (Nel,) covering all elements (solid + void).
+    # Void boundary elements share nodes with solids and accumulate
+    # artificial strain energy at full stiffness E0 -- summing them
+    # inflates compliance by 3-4 orders of magnitude and breaks
+    # convergence detection.  Use only solid contributions.
+    solid_mask_flat = state.mask.ravel()
+    compliance = float(alpha_e[solid_mask_flat].sum())
     return BESOState(
         mask=new_mask,
         alpha_history=hist,
