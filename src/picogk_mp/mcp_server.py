@@ -1,11 +1,8 @@
 """MCP server -- multiphysik design pipeline.
 
-Exposes the BESO topology optimiser, physics checks, and STL renderer
-as tools callable by Claude Code or any MCP-compatible client.
-
-Claude handles natural-language understanding; these tools handle the
-physics compute.  No SimEngine / parameter-resolver scaffolding is
-needed -- Claude asks for missing information conversationally.
+General physics-driven design workflow for any 3D-printed structural part.
+Claude acts as the natural-language → physics translator; these tools handle
+the compute.
 
 Registration (project-level .mcp.json)
 ---------------------------------------
@@ -21,18 +18,29 @@ Registration (project-level .mcp.json)
 
 Tools
 -----
-run_topopt       Full BESO optimisation: STL in -> optimised STL + PNG out
-check_physics    Structural safety-factor checks on any STL
-render_stl       STL -> PNG preview image (returned inline)
-list_stls        Discover STL files available in the project
+generate_shape   Build any geometry from SDF primitives (sphere/box/capsule/cylinder)
+run_topopt       BESO topology optimisation -- works on ANY STL with flexible BCs
+check_physics    Structural safety-factor checks (tipping + bending) on disc-base parts
+render_stl       STL -> inline PNG preview
+list_stls        Discover STL files in the project
+
+Workflow (Claude's role)
+------------------------
+1. Understand the design intent from natural language.
+2. Decompose the shape into SDF primitives -> call generate_shape.
+3. Identify load point, load direction, and fixture from the geometry
+   -> call run_topopt with the correct fixture_type / load_direction.
+4. Render the result and report safety factors.
+5. If constraints not met, adjust and iterate.
+
+Claude chooses primitives and boundary conditions; the tools handle physics.
 """
 from __future__ import annotations
 
-import base64
 import time
 import traceback
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
 import numpy as np
 from fastmcp import FastMCP
@@ -45,15 +53,21 @@ from fastmcp.utilities.types import Image
 mcp = FastMCP(
     "multiphysik",
     instructions=(
-        "Physics-aware generative design pipeline for 3D-printed parts. "
-        "Full workflow: generate_holder (parametric CAD from NL description) "
-        "-> run_topopt (BESO topology optimisation) "
-        "-> check_physics (structural safety factors) "
-        "-> render_stl (inline PNG preview). "
-        "Also: list_stls (discover existing STL files). "
-        "Always render the STL after generation or optimisation. "
-        "generate_holder returns arm_tip_x/y/z_mm and base_radius_mm "
-        "that can be passed directly into run_topopt."
+        "Physics-driven generative design pipeline for ANY 3D-printed structural part. "
+        "YOU are the natural-language -> physics translator. "
+        "\n\nWORKFLOW:\n"
+        "1. Decompose geometry into SDF primitives -> generate_shape "
+        "(sphere, box, capsule, cylinder). "
+        "2. Identify load point + fixture -> run_topopt "
+        "(fixture_type='disc_base'|'face', fixed_face='x0'/'z0'/etc, "
+        "load_direction='gravity'|'-x'|'+y'/etc). "
+        "3. render_stl to show the result inline. "
+        "4. check_physics for disc-base standing parts. "
+        "\n\nExamples of what you can build: headphone stand, wall bracket, "
+        "shelf arm, hook, drone frame, furniture joint, structural node, "
+        "any custom mechanical part. "
+        "\n\nAlways render after generate or optimise. "
+        "list_stls finds existing files."
     ),
 )
 
@@ -66,48 +80,137 @@ FIXTURES = ROOT / "tests" / "fixtures"
 
 
 # ===========================================================================
-# Tool 1 -- topology optimisation
+# Tool 1 -- general shape generator
+# ===========================================================================
+
+@mcp.tool()
+def generate_shape(
+    primitives:    list[dict[str, Any]],
+    resolution_mm: float = 1.0,
+    out_stl:       Optional[str] = None,
+) -> dict:
+    """Generate any 3D shape from a list of SDF primitives.
+
+    Builds watertight geometry by taking the SDF union of all primitives
+    and extracting a surface with marching cubes.  Works for ANY part:
+    headphone stands, wall brackets, hooks, drone frames, furniture joints,
+    structural nodes, custom tools -- anything describable with primitives.
+
+    Primitive types (all coordinates in mm)
+    ----------------------------------------
+    Sphere   : {"type":"sphere",   "center":[x,y,z], "radius":r}
+    Box      : {"type":"box",      "min":[x0,y0,z0], "max":[x1,y1,z1]}
+    Capsule  : {"type":"capsule",  "from":[x,y,z], "to":[x,y,z],
+                                   "radius_from":r0, "radius_to":r1}
+               Use radius_from==radius_to for a uniform beam/rod.
+    Cylinder : {"type":"cylinder", "center_xy":[cx,cy], "z_range":[z0,z1],
+                                   "radius":r}
+               Always z-axis aligned (upright).
+
+    Composition tips
+    ----------------
+    - Overlap primitives generously: SDF union fuses them smoothly at
+      any intersection without seams.
+    - Add a sphere at every joint/junction for a smooth, organic transition.
+    - Coordinate system is yours to choose -- just be consistent when you
+      later specify load_point and fixture in run_topopt.
+
+    Parameters
+    ----------
+    primitives    : List of primitive dicts (see types above).
+    resolution_mm : Grid pitch [mm].  1 = good quality (~1-5 s for typical
+                    parts).  2 = fast preview (~0.1-0.5 s).  0.5 = fine
+                    detail (~10-40 s).
+    out_stl       : Output path.  Default: docs/generated_shape.stl.
+
+    Returns
+    -------
+    dict: status, stl_path, volume_mm3, bounds_min/max ([x,y,z]), elapsed_s.
+    bounds_* describe the mesh bounding box -- use them to identify
+    sensible load_point coordinates for run_topopt.
+    """
+    from picogk_mp.generators.shape import generate_shape_stl
+
+    if out_stl:
+        out_path = Path(out_stl) if Path(out_stl).is_absolute() else ROOT / out_stl
+    else:
+        out_path = DOCS / "generated_shape.stl"
+
+    try:
+        result = generate_shape_stl(
+            primitives    = primitives,
+            resolution_mm = resolution_mm,
+            out_stl       = str(out_path),
+        )
+        if result.get("status") != "ok":
+            return result
+
+        # Auto-render preview
+        png_path = out_path.with_suffix(".png")
+        _render_to_file(out_path, png_path)
+        result["png_path"] = str(png_path)
+        return result
+
+    except Exception:
+        return {"status": "error", "message": traceback.format_exc()}
+
+
+# ===========================================================================
+# Tool 2 -- topology optimisation (general)
 # ===========================================================================
 
 @mcp.tool()
 def run_topopt(
     stl_path: str,
     load_mass_g: float,
-    arm_tip_x_mm: float,
-    arm_tip_y_mm: float,
-    arm_tip_z_mm: float,
+    load_point_x_mm: float,
+    load_point_y_mm: float,
+    load_point_z_mm: float,
+    fixture_type: str = "disc_base",
+    fixed_face: str = "z0",
     base_radius_mm: float = 48.0,
+    load_direction: str = "gravity",
     vol_frac: float = 0.75,
     safety_factor: float = 2.0,
     resolution_mm: float = 3.0,
     max_iter: int = 40,
     out_stl: Optional[str] = None,
 ) -> dict:
-    """Run BESO topology optimisation on a 3D-printed part.
+    """Run BESO topology optimisation on any 3D-printed structural part.
 
-    Iteratively removes low-stress material while preserving structural
-    integrity.  Returns the optimised STL path, achieved volume fraction,
-    compliance trajectory, and structural physics check results.
+    Works with any STL geometry -- not just headphone stands.  Iteratively
+    removes low-stress material while preserving structural integrity.
 
     Parameters
     ----------
-    stl_path       : Input STL (absolute path or relative to project root).
-    load_mass_g    : Operating load mass [g] -- e.g. headphone mass, payload.
-                     The design load is load_mass_g * safety_factor.
-    arm_tip_x_mm   : X coordinate of the load application point [mm].
-    arm_tip_y_mm   : Y coordinate of the load application point [mm].
-    arm_tip_z_mm   : Z coordinate of the load application point [mm].
-    base_radius_mm : Radius of the fixed support disc at z=0 [mm].
-    vol_frac       : Fraction of initial solid material to KEEP after
-                     optimisation (0.5 = aggressive, 0.85 = conservative).
-    safety_factor  : Multiplier applied to load_mass_g for FEM sizing.
-    resolution_mm  : Voxel pitch for the FEM mesh [mm].  3 mm balances
-                     accuracy and speed (~10-15 s/iteration).
-    max_iter       : Maximum BESO iterations (40 is usually sufficient).
-    out_stl        : Output path for optimised STL.
-                     Default: docs/optimised_<input-name>.stl
+    stl_path         : Input STL (absolute or project-relative path).
+    load_mass_g      : Operating load [g].  Design load = mass * safety_factor.
+    load_point_x_mm  : X of load application point [mm].
+    load_point_y_mm  : Y of load application point [mm].
+    load_point_z_mm  : Z of load application point [mm].
+    fixture_type     : How the part is supported:
+                       "disc_base" -- circular disc clamped at z=0.
+                                      Use for standing parts (stands, posts).
+                       "face"      -- entire face named by fixed_face clamped.
+                                      Use for wall brackets, bolted flanges,
+                                      glued surfaces, etc.
+    fixed_face       : Which face when fixture_type="face":
+                       x0=left  x1=right  y0=front  y1=back  z0=floor  z1=ceiling
+    base_radius_mm   : Disc radius [mm] -- only for fixture_type="disc_base".
+    load_direction   : Direction the load force acts:
+                       "gravity"/"-z"=down, "+z"=up,
+                       "-x"/"+x"=lateral X, "-y"/"+y"=lateral Y.
+    vol_frac         : Fraction of material to keep (0.5=aggressive,
+                       0.85=conservative).  Default 0.75.
+    safety_factor    : Design-load multiplier applied to load_mass_g.
+    resolution_mm    : Voxel pitch for FEM [mm].  3 mm = ~10 s/iter.
+    max_iter         : Maximum BESO iterations.
+    out_stl          : Output path.  Default: docs/optimised_<stem>.stl.
     """
     from picogk_mp.topopt import TopoptPipeline, BoundaryConditions
+    from picogk_mp.topopt.boundary import (
+        fixed_face_dofs, fixed_cylinder_base_dofs, point_load_dof,
+    )
 
     # --- resolve paths ---
     stl_in = Path(stl_path) if Path(stl_path).is_absolute() else ROOT / stl_path
@@ -115,16 +218,22 @@ def run_topopt(
         return {"status": "error", "message": f"STL not found: {stl_in}"}
 
     stem = stl_in.stem
-    out_stl_path = (
-        Path(out_stl) if out_stl
-        else DOCS / f"optimised_{stem}.stl"
-    )
+    out_stl_path = Path(out_stl) if out_stl else DOCS / f"optimised_{stem}.stl"
     out_png_path = out_stl_path.with_suffix(".png")
     out_stl_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # --- design load ---
+    # --- load direction vector ---
+    _dir_map = {
+        "gravity": (0.0, 0.0, -1.0), "-z": (0.0, 0.0, -1.0),
+        "+z": (0.0, 0.0, 1.0),
+        "-x": (-1.0, 0.0, 0.0), "+x": (1.0, 0.0, 0.0),
+        "-y": (0.0, -1.0, 0.0), "+y": (0.0, 1.0, 0.0),
+    }
+    dx, dy, dz = _dir_map.get(load_direction.lower(), (0.0, 0.0, -1.0))
+
     design_mass_g  = load_mass_g * safety_factor
     design_force_N = design_mass_g * 1e-3 * 9.81
+    force_N = (dx * design_force_N, dy * design_force_N, dz * design_force_N)
 
     try:
         t0 = time.time()
@@ -136,61 +245,71 @@ def run_topopt(
             max_iter=max_iter,
         )
 
-        bc = BoundaryConditions.headphone_holder(
-            *pipeline.grid_shape,
-            pipeline.h,
-            pipeline.offset,
-            base_radius_mm=base_radius_mm,
-            arm_tip_mm=(arm_tip_x_mm, arm_tip_y_mm, arm_tip_z_mm),
-            head_mass_g=design_mass_g,
+        Nx, Ny, Nz = pipeline.grid_shape
+        h, offset  = pipeline.h, pipeline.offset
+
+        # --- boundary conditions dispatch ---
+        ft = fixture_type.lower()
+        if ft == "disc_base":
+            fixed_dofs = fixed_cylinder_base_dofs(Nx, Ny, Nz, h, offset, base_radius_mm)
+        elif ft == "face":
+            face_key = fixed_face.lower()
+            if face_key not in ("x0", "x1", "y0", "y1", "z0", "z1"):
+                return {"status": "error",
+                        "message": f"fixed_face must be x0/x1/y0/y1/z0/z1, got '{fixed_face}'"}
+            fixed_dofs = fixed_face_dofs(Nx, Ny, Nz, face_key)
+        else:
+            return {"status": "error",
+                    "message": f"fixture_type must be 'disc_base' or 'face', got '{fixture_type}'"}
+
+        force_vec = point_load_dof(
+            Nx, Ny, Nz, h, offset,
+            position_mm=(load_point_x_mm, load_point_y_mm, load_point_z_mm),
+            force_N=force_N,
         )
+        bc = BoundaryConditions(fixed_dofs=fixed_dofs, force_vec=force_vec)
 
         pipeline.run(bc, out_stl=out_stl_path)
         elapsed = time.time() - t0
 
-        # --- compliance history ---
         final_state = getattr(pipeline, "_final_state", None)
         compliance_history = (
             [round(c, 4) for c in final_state.compliance_history]
-            if final_state is not None
-            else []
+            if final_state is not None else []
         )
-
-        # --- element counts ---
         elements_initial = int(pipeline.mask.sum())
         elements_final   = int(pipeline._final_mask.sum())
         vol_achieved     = round(elements_final / elements_initial, 3)
 
-        # --- render preview ---
         _render_to_file(out_stl_path, out_png_path)
 
-        # --- physics checks (at operating load, not design load) ---
-        arm_reach_mm = abs(arm_tip_x_mm)   # horizontal reach from base axis
-        physics = _physics_checks(
-            stl_path=str(out_stl_path),
-            load_mass_g=load_mass_g,
-            arm_reach_mm=arm_reach_mm,
-            base_radius_mm=base_radius_mm,
-        )
+        # physics checks: disc_base only (tipping + stem bending)
+        if ft == "disc_base":
+            reach = float(np.sqrt(load_point_x_mm**2 + load_point_y_mm**2))
+            physics = _physics_checks(
+                stl_path=str(out_stl_path),
+                load_mass_g=load_mass_g,
+                arm_reach_mm=reach,
+                base_radius_mm=base_radius_mm,
+            )
+        else:
+            physics = {"note": "generic fixture -- disc-base physics checks not applicable"}
 
         return {
-            "status": "ok",
-            "stl_path": str(out_stl_path),
-            "png_path": str(out_png_path),
+            "status":          "ok",
+            "stl_path":        str(out_stl_path),
+            "png_path":        str(out_png_path),
             "elements_initial": elements_initial,
             "elements_final":   elements_final,
             "vol_frac_achieved": vol_achieved,
-            "design_force_N":    round(design_force_N, 2),
-            "elapsed_s":         round(elapsed, 1),
-            "compliance_nm":     compliance_history,
-            "physics":           physics,
+            "design_force_N":   round(design_force_N, 2),
+            "elapsed_s":        round(elapsed, 1),
+            "compliance_nm":    compliance_history,
+            "physics":          physics,
         }
 
     except Exception:
-        return {
-            "status": "error",
-            "message": traceback.format_exc(),
-        }
+        return {"status": "error", "message": traceback.format_exc()}
 
 
 # ===========================================================================
