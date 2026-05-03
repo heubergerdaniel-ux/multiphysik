@@ -337,7 +337,8 @@ class TopoptPipeline:
         print("=" * 62)
         print()
 
-        self._final_mask = state.mask
+        self._final_mask  = state.mask
+        self._final_state = state           # gives callers access to compliance history
 
         if out_stl is not None:
             return self._export_stl(state.mask, Path(out_stl))
