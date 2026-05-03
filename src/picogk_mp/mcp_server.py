@@ -46,10 +46,14 @@ mcp = FastMCP(
     "multiphysik",
     instructions=(
         "Physics-aware generative design pipeline for 3D-printed parts. "
-        "Available tools: run_topopt (BESO topology optimisation), "
-        "check_physics (structural safety factors), render_stl (preview), "
-        "list_stls (discover available files). "
-        "Always render the STL after optimisation so the user can see it."
+        "Full workflow: generate_holder (parametric CAD from NL description) "
+        "-> run_topopt (BESO topology optimisation) "
+        "-> check_physics (structural safety factors) "
+        "-> render_stl (inline PNG preview). "
+        "Also: list_stls (discover existing STL files). "
+        "Always render the STL after generation or optimisation. "
+        "generate_holder returns arm_tip_x/y/z_mm and base_radius_mm "
+        "that can be passed directly into run_topopt."
     ),
 )
 
@@ -234,7 +238,84 @@ def check_physics(
 
 
 # ===========================================================================
-# Tool 3 -- render STL -> PNG (returned inline)
+# Tool 3 -- parametric base-design generator
+# ===========================================================================
+
+@mcp.tool()
+def generate_holder(
+    base_radius_mm:      float = 48.0,
+    base_height_mm:      float = 14.0,
+    stem_height_mm:      float = 234.0,
+    stem_radius_base_mm: float = 9.0,
+    stem_radius_top_mm:  float = 7.0,
+    arm_reach_mm:        float = 82.0,
+    arm_tip_z_mm:        float = 244.0,
+    arm_radius_mm:       float = 8.5,
+    end_cap_radius_mm:   float = 9.0,
+    resolution_mm:       float = 1.0,
+    out_stl: Optional[str] = None,
+) -> dict:
+    """Generate a parametric headphone-holder STL from design parameters.
+
+    Builds the full holder geometry (base disc + tapered stem + S-curve arm
+    + end cap) via a signed-distance-field union and scikit-image marching
+    cubes.  No picogk / external CAD kernel required.
+
+    The returned dict contains arm_tip_x/y/z_mm and base_radius_mm ready
+    to pass directly into run_topopt or check_physics.
+
+    Parameters
+    ----------
+    base_radius_mm      : Base disc radius [mm].  Larger = more stable.
+    base_height_mm      : Base disc thickness [mm].
+    stem_height_mm      : Height where the arm leaves the stem [mm].
+                          Total stand height is roughly stem_height_mm + 20.
+    stem_radius_base_mm : Stem radius at the base junction [mm].
+    stem_radius_top_mm  : Stem radius at the top junction [mm] (taper).
+    arm_reach_mm        : Horizontal reach of the hook tip [mm].
+    arm_tip_z_mm        : Z-height of the hook tip [mm].
+    arm_radius_mm       : Arm beam radius [mm].
+    end_cap_radius_mm   : End-cap sphere radius [mm].
+    resolution_mm       : SDF grid pitch [mm].  1 mm is a good balance
+                          (~5 s); use 0.5 for a finer mesh (~40 s).
+    out_stl             : Output path.  Default: docs/generated_holder.stl
+    """
+    from picogk_mp.generators.holder import generate_holder_stl
+
+    if out_stl is not None:
+        out_path = Path(out_stl) if Path(out_stl).is_absolute() else ROOT / out_stl
+    else:
+        out_path = DOCS / "generated_holder.stl"
+
+    try:
+        result = generate_holder_stl(
+            base_radius_mm      = base_radius_mm,
+            base_height_mm      = base_height_mm,
+            stem_height_mm      = stem_height_mm,
+            stem_radius_base_mm = stem_radius_base_mm,
+            stem_radius_top_mm  = stem_radius_top_mm,
+            arm_reach_mm        = arm_reach_mm,
+            arm_tip_z_mm        = arm_tip_z_mm,
+            arm_radius_mm       = arm_radius_mm,
+            end_cap_radius_mm   = end_cap_radius_mm,
+            resolution_mm       = resolution_mm,
+            out_stl             = str(out_path),
+        )
+
+        # Render preview
+        png_path = out_path.with_suffix(".png")
+        _render_to_file(out_path, png_path)
+        result["png_path"] = str(png_path)
+
+        return result
+
+    except Exception:
+        import traceback
+        return {"status": "error", "message": traceback.format_exc()}
+
+
+# ===========================================================================
+# Tool 5 -- render STL -> PNG (returned inline)
 # ===========================================================================
 
 @mcp.tool()
@@ -263,7 +344,7 @@ def render_stl(
 
 
 # ===========================================================================
-# Tool 4 -- list available STL files
+# Tool 6 -- list available STL files
 # ===========================================================================
 
 @mcp.tool()
