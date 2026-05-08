@@ -134,6 +134,15 @@ def _primitive_bounds(p: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
         z0, z1 = p["z_range"]
         r = float(p["radius"])
         return np.array([cx-r, cy-r, z0]), np.array([cx+r, cy+r, z1])
+    if t == "cone":
+        apex = np.array(p["apex"], dtype=float)
+        base = np.array(p["base"], dtype=float)
+        r = float(p["r_base"])
+        return np.minimum(apex, base) - r, np.maximum(apex, base) + r
+    if t == "torus":
+        c = np.array(p["center"], dtype=float)
+        extent = float(p["major_r"]) + float(p["minor_r"])
+        return c - extent, c + extent
     raise ValueError(f"Unknown primitive type: '{t}'")
 
 
