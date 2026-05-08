@@ -57,15 +57,18 @@ mcp = FastMCP(
         "YOU are the natural-language -> physics translator. "
         "\n\nWORKFLOW:\n"
         "1. Decompose geometry into SDF primitives -> generate_shape "
-        "(sphere, box, capsule, cylinder). "
+        "(sphere, box, capsule, cylinder) OR generate_shapek "
+        "(adds cone, torus, pipe). "
         "2. Identify load point + fixture -> run_topopt "
         "(fixture_type='disc_base'|'face', fixed_face='x0'/'z0'/etc, "
         "load_direction='gravity'|'-x'|'+y'/etc). "
         "3. render_stl to show the result inline. "
         "4. check_physics for disc-base standing parts. "
+        "5. measure_shape for volume, mass, CoG, and inertia tensor. "
+        "6. generate_lattice for beam-based infill (requires picogk.go). "
         "\n\nExamples of what you can build: headphone stand, wall bracket, "
         "shelf arm, hook, drone frame, furniture joint, structural node, "
-        "any custom mechanical part. "
+        "ring/torus structures, tapered pipes, any custom mechanical part. "
         "\n\nAlways render after generate or optimise. "
         "list_stls finds existing files."
     ),
@@ -493,6 +496,211 @@ def list_stls() -> dict:
             except (OSError, ValueError):
                 pass
     return {"stls": stls, "count": len(stls)}
+
+
+# ===========================================================================
+# Tool 7 -- shapek extended shape generator
+# ===========================================================================
+
+@mcp.tool()
+def generate_shapek(
+    shapes:        list[dict[str, Any]],
+    resolution_mm: float = 1.0,
+    out_stl:       Optional[str] = None,
+) -> dict:
+    """Generate geometry using ShapeKernel-extended primitives (superset of generate_shape).
+
+    Supports all generate_shape primitive types plus:
+
+    Cone   : {"type":"cone",  "apex":[x,y,z], "base":[x,y,z], "r_base":r}
+             Solid cone from apex point to circular base.
+    Torus  : {"type":"torus", "center":[x,y,z], "major_r":R, "minor_r":r}
+             major_r = ring radius, minor_r = tube cross-section radius.
+    Pipe   : {"type":"pipe",
+              "spine":[[x0,y0,z0],[x1,y1,z1],...],
+              "radius": r}             (constant radius)
+           OR {"type":"pipe", "spine":[...], "radii":[r0,r1,...]}
+             (one radius per spine waypoint, cubic spline interpolated)
+             Pipe follows a polyline spine with smoothly modulated radius.
+
+    All coordinates in mm. Builds a watertight STL via marching cubes.
+
+    Parameters
+    ----------
+    shapes        : List of primitive dicts (see types above).
+    resolution_mm : Grid pitch [mm].  1=good quality, 2=fast preview, 0.5=fine.
+    out_stl       : Output path.  Default: docs/generated_shape.stl.
+
+    Returns
+    -------
+    dict: status, stl_path, volume_mm3, bounds_min/max, elapsed_s, png_path.
+    """
+    import picogk_mp.shapek  # triggers _DISPATCH extension
+    from picogk_mp.shapek.base_shape import build_compound_from_spec
+
+    if out_stl:
+        out_path = Path(out_stl) if Path(out_stl).is_absolute() else ROOT / out_stl
+    else:
+        out_path = DOCS / "generated_shape.stl"
+
+    try:
+        compound = build_compound_from_spec(shapes)
+        result = compound.mesh_stl(resolution_mm=resolution_mm, out_stl=str(out_path))
+        if result.get("status") != "ok":
+            return result
+        png_path = out_path.with_suffix(".png")
+        _render_to_file(out_path, png_path)
+        result["png_path"] = str(png_path)
+        return result
+    except Exception:
+        return {"status": "error", "message": traceback.format_exc()}
+
+
+# ===========================================================================
+# Tool 8 -- measure_shape
+# ===========================================================================
+
+@mcp.tool()
+def measure_shape(
+    stl_path:             str,
+    density_g_cm3:        float = 1.24,
+    infill_pct:           float = 20.0,
+    report_principal_axes: bool = False,
+) -> dict:
+    """Measure physical properties of an STL file.
+
+    Computes volume, surface area, centre of gravity, mass, and the
+    inertia tensor.  No picogk context required -- works headlessly.
+
+    Parameters
+    ----------
+    stl_path              : STL to measure (absolute or project-relative).
+    density_g_cm3         : Raw filament density [g/cm3].  PLA default: 1.24.
+    infill_pct            : Print infill percentage 0-100.  Default: 20.
+    report_principal_axes : If True, include eigendecomposition of inertia
+                            tensor (principal moments + axes).
+
+    Returns
+    -------
+    dict: status, volume_mm3, surface_area_mm2, mass_g, cog_mm [x,y,z],
+          inertia_tensor_g_mm2 (3x3 as nested list). Optionally:
+          principal_moments [I1,I2,I3], principal_axes (3x3 nested list).
+    """
+    from picogk_mp.shapek.measure import Measure
+
+    stl_p = Path(stl_path) if Path(stl_path).is_absolute() else ROOT / stl_path
+    if not stl_p.exists():
+        return {"status": "error", "message": f"STL not found: {stl_p}"}
+
+    try:
+        m = Measure.from_stl(stl_p, density_g_cm3=density_g_cm3, infill_pct=infill_pct)
+        result: dict[str, Any] = {
+            "status":              "ok",
+            "volume_mm3":          m.volume_mm3,
+            "surface_area_mm2":    m.surface_area_mm2,
+            "mass_g":              m.mass_g,
+            "cog_mm":              [round(float(v), 2) for v in m.center_of_gravity_mm],
+            "inertia_tensor_g_mm2": [
+                [round(float(v), 4) for v in row]
+                for row in m.inertia_tensor_g_mm2
+            ],
+        }
+        if report_principal_axes:
+            vals, vecs = Measure.principal_axes(m)
+            result["principal_moments"] = [round(float(v), 4) for v in vals]
+            result["principal_axes"]    = [
+                [round(float(v), 6) for v in col]
+                for col in vecs.T.tolist()
+            ]
+        return result
+    except Exception:
+        return {"status": "error", "message": traceback.format_exc()}
+
+
+# ===========================================================================
+# Tool 9 -- generate_lattice
+# ===========================================================================
+
+@mcp.tool()
+def generate_lattice(
+    lattice_type:   str,
+    bounds_min:     list[float],
+    bounds_max:     list[float],
+    cell_size_mm:   float,
+    strut_radius_mm: float,
+    clip_stl:       Optional[str] = None,
+    out_stl:        Optional[str] = None,
+) -> dict:
+    """Generate a beam-based engineering lattice infill (requires picogk.go context).
+
+    Uses picogk.Lattice natively (C++, sub-second for typical densities).
+    Much faster than TPMS for filling a bounding box.
+
+    Parameters
+    ----------
+    lattice_type    : "cubic" (12-edge unit cell). More types planned.
+    bounds_min      : [x,y,z] minimum corner of the fill region [mm].
+    bounds_max      : [x,y,z] maximum corner of the fill region [mm].
+    cell_size_mm    : Unit cell edge length [mm].
+    strut_radius_mm : Strut / beam radius [mm].
+    clip_stl        : Optional STL path. If supplied, the lattice is boolean-
+                      intersected with the shape from that STL (useful for
+                      filling an irregular solid with lattice infill).
+    out_stl         : Output path. Default: docs/generated_lattice.stl.
+
+    Returns
+    -------
+    dict: status, stl_path, volume_mm3, node_count, beam_count,
+          elapsed_s, png_path.
+    """
+    from picogk_mp.shapek.lattice import EngineeringLattice
+
+    out_path = (
+        Path(out_stl) if out_stl and Path(out_stl).is_absolute()
+        else ROOT / out_stl if out_stl
+        else DOCS / "generated_lattice.stl"
+    )
+
+    try:
+        if lattice_type.lower() != "cubic":
+            return {
+                "status": "error",
+                "message": f"lattice_type '{lattice_type}' not yet supported. Use 'cubic'.",
+            }
+
+        lat = EngineeringLattice().fill_box(
+            bounds_min, bounds_max, cell_size_mm, strut_radius_mm
+        )
+        result = lat.mesh_stl(out_path)
+        if result.get("status") != "ok":
+            return result
+
+        # Optional: intersect with clip geometry
+        if clip_stl is not None:
+            from picogk_mp.csg import intersection
+            from picogk import Mesh, Voxels  # type: ignore[import]
+
+            clip_p = Path(clip_stl) if Path(clip_stl).is_absolute() else ROOT / clip_stl
+            if not clip_p.exists():
+                return {"status": "error", "message": f"clip_stl not found: {clip_p}"}
+
+            lat_vox  = lat.voxelize()
+            clip_vox = Voxels.from_mesh(Mesh.mshFromStlFile(str(clip_p)))
+            combined = intersection(lat_vox, clip_vox)
+
+            mesh = Mesh.from_voxels(combined)
+            out_path.parent.mkdir(parents=True, exist_ok=True)
+            mesh.SaveToStlFile(str(out_path))
+            vol, _ = combined.calculate_properties()
+            result["volume_mm3"] = round(float(vol))
+
+        png_path = out_path.with_suffix(".png")
+        _render_to_file(out_path, png_path)
+        result["png_path"] = str(png_path)
+        return result
+
+    except Exception:
+        return {"status": "error", "message": traceback.format_exc()}
 
 
 # ===========================================================================
