@@ -66,6 +66,8 @@ mcp = FastMCP(
         "4. check_physics for disc-base standing parts. "
         "5. measure_shape for volume, mass, CoG, and inertia tensor. "
         "6. generate_lattice for beam-based infill (requires picogk.go). "
+        "7. run_cfd_flow for aerodynamic drag (Cd, Re, velocity field). "
+        "8. run_cfd_thermal for convective cooling (h_conv, temperature field). "
         "\n\nExamples of what you can build: headphone stand, wall bracket, "
         "shelf arm, hook, drone frame, furniture joint, structural node, "
         "ring/torus structures, tapered pipes, any custom mechanical part. "
@@ -698,6 +700,173 @@ def generate_lattice(
         _render_to_file(out_path, png_path)
         result["png_path"] = str(png_path)
         return result
+
+    except Exception:
+        return {"status": "error", "message": traceback.format_exc()}
+
+
+# ===========================================================================
+# Tool 10 -- CFD-A: external flow (drag coefficient)
+# ===========================================================================
+
+@mcp.tool()
+def run_cfd_flow(
+    stl_path:        str,
+    velocity_m_s:    float = 0.5,
+    flow_direction:  str   = "x",
+    resolution_mm:   float = 3.0,
+    max_steps:       int   = 3000,
+    out_png:         Optional[str] = None,
+) -> dict:
+    """Compute 2D external flow around an STL part (D2Q9 Lattice-Boltzmann).
+
+    Simulates a 2D cross-section of the part in a free-stream flow and
+    returns the drag coefficient Cd, Reynolds number Re, pressure drop,
+    and a velocity-field PNG showing streamlines around the shape.
+
+    Parameters
+    ----------
+    stl_path       : Input STL (absolute or project-relative).
+    velocity_m_s   : Free-stream velocity [m/s].  Default 0.5 m/s (gentle desk
+                     air current).
+    flow_direction : "x", "y", or "z" -- axis aligned with the flow.
+    resolution_mm  : Lattice cell size [mm].  3 mm is a good balance of speed
+                     and accuracy.  Use 2 mm for finer detail.
+    max_steps      : Maximum LBM time steps.  Simulation converges earlier if
+                     the velocity field stabilises.
+    out_png        : Path for the velocity PNG.  Default: docs/<stem>_flow.png.
+
+    Returns
+    -------
+    dict: status, Cd, Re, pressure_drop_Pa, velocity_png, Ny, Nx, elapsed_s.
+    """
+    from picogk_mp.cfd import run_flow
+    from picogk_mp.cfd.postprocess import save_velocity_png
+
+    stl_p = Path(stl_path) if Path(stl_path).is_absolute() else ROOT / stl_path
+    if not stl_p.exists():
+        return {"status": "error", "message": f"STL not found: {stl_p}"}
+
+    png_p = (
+        Path(out_png) if out_png
+        else DOCS / f"{stl_p.stem}_flow.png"
+    )
+
+    try:
+        result = run_flow(
+            stl_path=stl_p,
+            velocity_m_s=velocity_m_s,
+            flow_direction=flow_direction,
+            resolution_mm=resolution_mm,
+            max_steps=max_steps,
+        )
+
+        png_path = save_velocity_png(result, png_p)
+
+        # Pressure drop: mean inlet pressure - mean outlet pressure [Pa]
+        rho_air = 1.2   # kg/m3
+        cs2_phys = (result.domain.U_lb * result.domain.velocity_m_s
+                    / result.domain.U_lb) ** 2 / 3.0
+        rho_lb = result.rho_lb
+        # Simplified: pressure in lattice units ~ rho * cs2
+        p_in  = float(rho_lb[:, 1].mean()) / 3.0
+        p_out = float(rho_lb[:, -2].mean()) / 3.0
+        # Convert lattice pressure to Pascals (approximate)
+        U_phys = result.domain.velocity_m_s
+        dp_Pa  = (p_in - p_out) * rho_air * U_phys**2
+
+        return {
+            "status":           "ok",
+            "Cd":               round(result.Cd, 4),
+            "Re":               round(result.Re, 1),
+            "pressure_drop_Pa": round(dp_Pa, 4),
+            "Ny":               result.domain.Ny,
+            "Nx":               result.domain.Nx,
+            "velocity_png":     str(png_path),
+            "elapsed_s":        result.elapsed_s,
+        }
+
+    except Exception:
+        return {"status": "error", "message": traceback.format_exc()}
+
+
+# ===========================================================================
+# Tool 11 -- CFD-B: convective thermal analysis
+# ===========================================================================
+
+@mcp.tool()
+def run_cfd_thermal(
+    stl_path:       str,
+    velocity_m_s:   float = 0.5,
+    heat_flux_W_m2: float = 1000.0,
+    T_inlet_C:      float = 20.0,
+    flow_direction: str   = "x",
+    resolution_mm:  float = 3.0,
+    max_steps:      int   = 3000,
+    out_png:        Optional[str] = None,
+) -> dict:
+    """Compute convective cooling of an STL part (D2Q9 + D2Q5 LBM).
+
+    First runs an external-flow simulation to obtain the velocity field,
+    then solves the heat equation (advection-diffusion) to find the
+    temperature distribution and convective heat transfer coefficient.
+
+    Parameters
+    ----------
+    stl_path       : Input STL.
+    velocity_m_s   : Free-stream velocity [m/s].
+    heat_flux_W_m2 : Heat flux emitted from the solid surface [W/m2].
+    T_inlet_C      : Inlet / ambient air temperature [C].
+    flow_direction : "x", "y", or "z".
+    resolution_mm  : Lattice cell size [mm].
+    max_steps      : Max LBM steps for each solver phase.
+    out_png        : Path for the temperature PNG.  Default: docs/<stem>_thermal.png.
+
+    Returns
+    -------
+    dict: status, h_conv_W_m2K, T_max_C, T_surface_avg_C, Cd, Re,
+          temperature_png, elapsed_s.
+    """
+    from picogk_mp.cfd import run_flow, run_thermal
+    from picogk_mp.cfd.postprocess import save_temperature_png
+
+    stl_p = Path(stl_path) if Path(stl_path).is_absolute() else ROOT / stl_path
+    if not stl_p.exists():
+        return {"status": "error", "message": f"STL not found: {stl_p}"}
+
+    png_p = (
+        Path(out_png) if out_png
+        else DOCS / f"{stl_p.stem}_thermal.png"
+    )
+
+    try:
+        flow = run_flow(
+            stl_path=stl_p,
+            velocity_m_s=velocity_m_s,
+            flow_direction=flow_direction,
+            resolution_mm=resolution_mm,
+            max_steps=max_steps,
+        )
+
+        thermal = run_thermal(
+            flow_result=flow,
+            heat_flux_W_m2=heat_flux_W_m2,
+            T_inlet_C=T_inlet_C,
+            max_steps=max_steps,
+        )
+
+        png_path = save_temperature_png(thermal, png_p)
+
+        return {
+            "status":           "ok",
+            "h_conv_W_m2K":     round(thermal.h_conv, 2),
+            "T_max_C":          round(thermal.T_max, 2),
+            "T_surface_avg_C":  round(thermal.T_surface_avg, 2),
+            "Cd":               round(flow.Cd, 4),
+            "Re":               round(flow.Re, 1),
+            "temperature_png":  str(png_path),
+            "elapsed_s":        round(flow.elapsed_s + thermal.elapsed_s, 1),
+        }
 
     except Exception:
         return {"status": "error", "message": traceback.format_exc()}
