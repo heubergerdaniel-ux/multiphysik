@@ -2,7 +2,7 @@
 import math
 import pytest
 
-from picogk_mp.physics import Param, SimEngine, TippingCheck, StemBendingCheck
+from picogk_mp.physics import Param, SimEngine, TippingCheck, SectionBendingCheck, StemBendingCheck
 from picogk_mp.physics.engine import PhysicsFailure
 
 
@@ -55,9 +55,9 @@ class TestParam:
         assert not p.is_resolved
 
     def test_prompt_text_contains_label_and_unit(self):
-        p = Param("mass", "Kopfhoerermasse", unit="g", lo=50, hi=1000, default=400)
+        p = Param("mass", "Betriebslast", unit="g", lo=50, hi=1000, default=400)
         txt = p.prompt_text()
-        assert "Kopfhoerermasse" in txt
+        assert "Betriebslast" in txt
         assert "[g]" in txt
         assert "50" in txt
         assert "1000" in txt
@@ -68,24 +68,24 @@ class TestParam:
 # TippingCheck tests
 # ======================================================================
 
-# arm (82mm) inside base (95mm) -> instant pass, no SF calculation
+# load_reach (82mm) inside base (95mm) -> instant pass, no SF calculation
 STABLE_CTX = {
-    "head_mass_g":   350,
-    "base_r_mm":     95,
-    "arm_reach_mm":  82,
-    "volume_mm3":    300_000,
-    "infill_pct":    100,
-    "density_g_cm3": 1.24,
+    "load_mass_g":    350,
+    "base_r_mm":      95,
+    "load_reach_mm":  82,
+    "volume_mm3":     300_000,
+    "infill_pct":     100,
+    "density_g_cm3":  1.24,
 }
 
-# arm (82mm) outside base (70mm) but big enough to pass SF >= 1.5
+# load_reach (82mm) outside base (70mm) but large enough to pass SF >= 1.5
 STABLE_SF_CTX = {
-    "head_mass_g":   350,
-    "base_r_mm":     70,
-    "arm_reach_mm":  82,
-    "volume_mm3":    500_000,
-    "infill_pct":    100,
-    "density_g_cm3": 1.24,
+    "load_mass_g":    350,
+    "base_r_mm":      70,
+    "load_reach_mm":  82,
+    "volume_mm3":     500_000,
+    "infill_pct":     100,
+    "density_g_cm3":  1.24,
 }
 
 UNSTABLE_CTX = {
@@ -105,14 +105,14 @@ class TestTippingCheck:
         assert not r.passed
         assert r.sf < 1.5
 
-    def test_no_tip_risk_when_arm_inside_base(self):
-        ctx = {**STABLE_CTX, "arm_reach_mm": 40, "base_r_mm": 95}
+    def test_no_tip_risk_when_load_inside_base(self):
+        ctx = {**STABLE_CTX, "load_reach_mm": 40, "base_r_mm": 95}
         r = TippingCheck().evaluate(ctx)
         assert r.passed
         assert r.sf == 999.0
 
     def test_detail_contains_sf(self):
-        # Use STABLE_SF_CTX where arm extends beyond base -> SF is calculated
+        # Use STABLE_SF_CTX where load extends beyond base -> SF is calculated
         r = TippingCheck().evaluate(STABLE_SF_CTX)
         assert "SF=" in r.detail
 
@@ -127,36 +127,43 @@ class TestTippingCheck:
 
 
 # ======================================================================
-# StemBendingCheck tests
+# SectionBendingCheck tests
 # ======================================================================
 
 BEND_CTX = {
-    "head_mass_g":    400,
-    "arm_reach_mm":   82,
-    "stem_r_min_mm":  5.0,   # 10mm diameter stem (tapered end)
+    "load_mass_g":    400,
+    "load_reach_mm":  82,
+    "section_r_mm":   5.0,   # 10mm diameter section (tapered end)
     "yield_mpa":      60.0,  # PLA typical yield ~50-65 MPa
 }
 
-class TestStemBendingCheck:
-    def test_passes_for_thick_stem(self):
-        ctx = {**BEND_CTX, "stem_r_min_mm": 8.0}
-        r = StemBendingCheck().evaluate(ctx)
+class TestSectionBendingCheck:
+    def test_passes_for_thick_section(self):
+        ctx = {**BEND_CTX, "section_r_mm": 8.0}
+        r = SectionBendingCheck().evaluate(ctx)
         assert r.passed, f"Expected pass, SF={r.sf:.2f}"
 
-    def test_fails_for_thin_stem(self):
-        ctx = {**BEND_CTX, "stem_r_min_mm": 1.5}
-        r = StemBendingCheck().evaluate(ctx)
+    def test_fails_for_thin_section(self):
+        ctx = {**BEND_CTX, "section_r_mm": 1.5}
+        r = SectionBendingCheck().evaluate(ctx)
         assert not r.passed
 
     def test_sf_scales_with_radius(self):
-        r_thin  = StemBendingCheck().evaluate({**BEND_CTX, "stem_r_min_mm": 4.0})
-        r_thick = StemBendingCheck().evaluate({**BEND_CTX, "stem_r_min_mm": 8.0})
+        r_thin  = SectionBendingCheck().evaluate({**BEND_CTX, "section_r_mm": 4.0})
+        r_thick = SectionBendingCheck().evaluate({**BEND_CTX, "section_r_mm": 8.0})
         assert r_thick.sf > r_thin.sf
 
     def test_detail_contains_moment_and_stress(self):
-        r = StemBendingCheck().evaluate(BEND_CTX)
+        r = SectionBendingCheck().evaluate(BEND_CTX)
         assert "N*mm" in r.detail
         assert "MPa" in r.detail
+
+    def test_stem_bending_alias_works(self):
+        # StemBendingCheck is a backwards-compat alias -- must produce identical results
+        r1 = SectionBendingCheck().evaluate(BEND_CTX)
+        r2 = StemBendingCheck().evaluate(BEND_CTX)
+        assert r1.sf == r2.sf
+        assert r1.passed == r2.passed
 
 
 # ======================================================================
@@ -164,56 +171,56 @@ class TestStemBendingCheck:
 # ======================================================================
 
 def _make_engine(resolver: dict) -> SimEngine:
-    """Helper: engine with all params for headphone holder scenario."""
+    """Helper: engine with tipping + bending checks for a disc-base standing part."""
     engine = SimEngine(resolver=resolver)
     engine.register(
-        Param("head_mass_g",   "Kopfhoerermasse",   unit="g",      lo=50,   hi=2000),
+        Param("load_mass_g",   "Betriebslast",      unit="g",      lo=50,   hi=2000),
         Param("infill_pct",    "Infill",            unit="%",      default=20, lo=5, hi=100),
         Param("density_g_cm3", "Materialdichte",    unit="g/cm3",  default=1.24),
         Param("yield_mpa",     "Streckgrenze",      unit="MPa",    default=55.0),
         # geometry -- injected later
         Param("base_r_mm",     "Basisradius",       unit="mm"),
-        Param("arm_reach_mm",  "Armreichweite",     unit="mm"),
+        Param("load_reach_mm", "Lastreichweite",    unit="mm"),
         Param("volume_mm3",    "Volumen",           unit="mm3"),
-        Param("stem_r_min_mm", "Stem-Mindestradius", unit="mm"),
+        Param("section_r_mm",  "Mindestradius",     unit="mm"),
     )
     engine.add_check(TippingCheck())
-    engine.add_check(StemBendingCheck())
+    engine.add_check(SectionBendingCheck())
     return engine
 
 
 class TestSimEngine:
     def test_passes_stable_design(self):
-        engine = _make_engine({"head_mass_g": 350})
+        engine = _make_engine({"load_mass_g": 350})
         engine.inject(
-            base_r_mm=95, arm_reach_mm=82,
-            volume_mm3=400_000, stem_r_min_mm=7.0,
+            base_r_mm=95, load_reach_mm=82,
+            volume_mm3=400_000, section_r_mm=7.0,
         )
         results = engine.run(raise_on_failure=False)
         assert all(r.passed for r in results), [str(r) for r in results]
 
     def test_raises_on_unstable_design(self):
-        engine = _make_engine({"head_mass_g": 350})
+        engine = _make_engine({"load_mass_g": 350})
         engine.inject(
-            base_r_mm=48, arm_reach_mm=82,     # original too-small base
-            volume_mm3=172_355, stem_r_min_mm=7.0,
+            base_r_mm=48, load_reach_mm=82,     # too-small base
+            volume_mm3=172_355, section_r_mm=7.0,
         )
         with pytest.raises(PhysicsFailure):
             engine.run(raise_on_failure=True)
 
     def test_resolver_dict_shorthand(self):
         # All params registered BEFORE inject so inject() finds them
-        engine = SimEngine(resolver={"head_mass_g": 400})
+        engine = SimEngine(resolver={"load_mass_g": 400})
         engine.register(
-            Param("head_mass_g",   "Masse",      unit="g",     lo=50, hi=2000),
-            Param("infill_pct",    "Infill",     unit="%",     default=20),
-            Param("density_g_cm3", "Dichte",     unit="g/cm3", default=1.24),
-            Param("base_r_mm",     "Basis",      unit="mm"),
-            Param("arm_reach_mm",  "Reichweite", unit="mm"),
-            Param("volume_mm3",    "Volumen",    unit="mm3"),
+            Param("load_mass_g",   "Betriebslast", unit="g",     lo=50, hi=2000),
+            Param("infill_pct",    "Infill",       unit="%",     default=20),
+            Param("density_g_cm3", "Dichte",       unit="g/cm3", default=1.24),
+            Param("base_r_mm",     "Basis",        unit="mm"),
+            Param("load_reach_mm", "Reichweite",   unit="mm"),
+            Param("volume_mm3",    "Volumen",      unit="mm3"),
         )
         engine.add_check(TippingCheck())
-        engine.inject(base_r_mm=95, arm_reach_mm=82, volume_mm3=400_000)
+        engine.inject(base_r_mm=95, load_reach_mm=82, volume_mm3=400_000)
         results = engine.run(raise_on_failure=False)
         assert results[0].passed
 
@@ -225,11 +232,11 @@ class TestSimEngine:
         assert engine._params["base_r_mm"].resolved_value == 95.0
 
     def test_summary_lists_params_and_checks(self):
-        engine = _make_engine({"head_mass_g": 400})
-        engine.inject(base_r_mm=95, arm_reach_mm=82, volume_mm3=300_000, stem_r_min_mm=7.0)
+        engine = _make_engine({"load_mass_g": 400})
+        engine.inject(base_r_mm=95, load_reach_mm=82, volume_mm3=300_000, section_r_mm=7.0)
         s = engine.summary()
         assert "SimEngine" in s
-        assert "head_mass_g" in s
+        assert "load_mass_g" in s
         assert "Kippstabilitaet" in s
 
     def test_no_checks_returns_empty_list(self):
@@ -238,10 +245,10 @@ class TestSimEngine:
         assert results == []
 
     def test_raise_on_failure_false_returns_results(self):
-        engine = _make_engine({"head_mass_g": 350})
+        engine = _make_engine({"load_mass_g": 350})
         engine.inject(
-            base_r_mm=48, arm_reach_mm=82,
-            volume_mm3=172_355, stem_r_min_mm=7.0,
+            base_r_mm=48, load_reach_mm=82,
+            volume_mm3=172_355, section_r_mm=7.0,
         )
         results = engine.run(raise_on_failure=False)
         failed = [r for r in results if not r.passed]

@@ -40,7 +40,7 @@ from __future__ import annotations
 import time
 import traceback
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any, Dict, List, Optional
 
 import numpy as np
 from fastmcp import FastMCP
@@ -55,7 +55,10 @@ mcp = FastMCP(
     instructions=(
         "Physics-driven generative design pipeline for ANY 3D-printed structural part. "
         "YOU are the natural-language -> physics translator. "
-        "\n\nWORKFLOW:\n"
+        "\n\nWORKFLOW (PFLICHT-REIHENFOLGE):\n"
+        "0. create_physics_brief FIRST -- before any geometry call. "
+        "   Translate the user prompt into a structured brief. "
+        "   brief_id links all subsequent tools. "
         "1. Decompose geometry into SDF primitives -> generate_shape "
         "(sphere, box, capsule, cylinder) OR generate_shapek "
         "(adds cone, torus, pipe). "
@@ -76,12 +79,195 @@ mcp = FastMCP(
     ),
 )
 
+# In-memory store for active PhysicsBriefs (brief_id -> dict)
+_BRIEF_STORE: Dict[str, dict] = {}
+
 # Project root: three levels up from this file
 # src/picogk_mp/mcp_server.py -> src/picogk_mp -> src -> project root
 _THIS = Path(__file__).resolve()
 ROOT  = _THIS.parent.parent.parent
 DOCS  = ROOT / "docs"
 FIXTURES = ROOT / "tests" / "fixtures"
+
+
+# ===========================================================================
+# Tool 0 -- physics brief (WORKFLOW-PFLICHT: vor jedem generate_shape/run_topopt)
+# ===========================================================================
+
+@mcp.tool()
+def create_physics_brief(
+    source_prompt: str,
+    # Material
+    material_preset: str = "PLA",
+    infill_pct: float = 20.0,
+    # LoadCases  [{"load_type": "force", "magnitude": 49.05, "direction": [0,0,-1],
+    #              "application_point": [120,0,0], "sf_static": 2.0}]
+    load_cases: Optional[List[dict]] = None,
+    load_combination: str = "AND",
+    # Constraints [{"constraint_type": "fixed_face", "face": "x0"}]
+    #              {"constraint_type": "fixed_disc", "disc_radius_mm": 48.0}]
+    constraints: Optional[List[dict]] = None,
+    # FailureCriteria
+    sf_fracture: float = 5.0,
+    sf_tipping: float = 1.5,
+    sf_bending: float = 3.0,
+    sf_torsion: float = 3.0,
+    sf_buckling: float = 3.0,
+    sf_tension: float = 2.0,
+    max_Cd: float = 2.0,
+    max_deformation_mm: Optional[float] = None,
+    min_wall_mm: float = 1.2,
+    max_overhang_deg: float = 45.0,
+    # DesignIntent
+    component_type: str = "custom",
+    keywords: Optional[List[str]] = None,
+    geometry_language: str = "primitives",
+    intent_notes: str = "",
+    # Material overrides (only for preset="CUSTOM")
+    E_mpa: Optional[float] = None,
+    nu: Optional[float] = None,
+    density_g_cm3: Optional[float] = None,
+    yield_mpa: Optional[float] = None,
+) -> dict:
+    """Translate a natural-language design prompt into a structured PhysicsBrief.
+
+    CALL THIS FIRST -- before generate_shape or run_topopt.
+    The returned brief_id links geometry, simulation, and validation together.
+
+    The brief encodes what the part must do (loads, constraints, safety factors)
+    BEFORE any geometry is chosen.  derive() fields in the response tell Claude
+    the minimum geometry dimensions required to satisfy each requirement.
+
+    Parameters
+    ----------
+    source_prompt    : The user's natural-language description (verbatim).
+    material_preset  : "PLA" | "PETG" | "ABS" | "PA12" | "TPU" | "CUSTOM"
+    infill_pct       : Print infill [%].  Default 20.
+    load_cases       : List of load case dicts.  Each must have:
+                       load_type ("force"|"moment"|"torsion"|"pressure"|
+                                  "temperature"|"gravity"|"flow")
+                       magnitude  [N | N*mm | MPa | K | g]
+                       For FORCE: direction [dx,dy,dz] is required.
+                       Optional: application_point [x,y,z], sf_static, sf_dynamic.
+    load_combination : "AND" (worst case, default) or "OR" (alternating).
+    constraints      : List of constraint dicts.  Each must have:
+                       constraint_type ("fixed_face"|"fixed_disc"|"hinge"|...)
+                       FIXED_FACE needs face ("x0"|"x1"|"y0"|"y1"|"z0"|"z1").
+                       FIXED_DISC needs disc_radius_mm.
+    component_type   : "bracket"|"housing"|"beam"|"clamp"|"connector"|
+                       "pipe"|"stand"|"frame"|"custom"
+    keywords         : Design intent hints: "leichtgewichtig", "maximale Steifigkeit", etc.
+
+    Returns
+    -------
+    dict with:
+        status            : "ok" | "validation_failed" | "error"
+        brief_id          : Short ID to pass to other tools.
+        validation_errors : List of error strings (empty = valid).
+        geometry_hints    : Recommended geometry class, cross-section, vol_frac.
+        derived_geometry  : Min geometry params from each requirement.
+        brief_json        : Full brief as JSON-serialisable dict.
+    """
+    from picogk_mp.physics.brief import (
+        Constraint, ConstraintType, DesignIntent, FailureCriteria,
+        GeometryLanguage, LoadCase, LoadCombination, LoadType,
+        Material, MaterialPreset, PhysicsBrief, ComponentType,
+    )
+    from picogk_mp.physics.brief_mapper import (
+        brief_to_requirements, brief_to_topopt_kwargs, suggest_geometry,
+    )
+
+    try:
+        # Build Material
+        mat = Material(
+            preset=MaterialPreset(material_preset),
+            infill_pct=infill_pct,
+            E_mpa=E_mpa,
+            nu=nu,
+            density_g_cm3=density_g_cm3,
+            yield_mpa=yield_mpa,
+        )
+
+        # Build LoadCases
+        lc_list = []
+        for lc_dict in (load_cases or []):
+            lc_list.append(LoadCase.from_dict(lc_dict))
+
+        # Build Constraints
+        con_list = []
+        for c_dict in (constraints or []):
+            con_list.append(Constraint.from_dict(c_dict))
+
+        # Build FailureCriteria
+        failure = FailureCriteria(
+            sf_fracture=sf_fracture,
+            sf_tipping=sf_tipping,
+            sf_bending=sf_bending,
+            sf_torsion=sf_torsion,
+            sf_buckling=sf_buckling,
+            sf_tension=sf_tension,
+            max_Cd=max_Cd,
+            max_deformation_mm=max_deformation_mm,
+            min_wall_thickness_mm=min_wall_mm,
+            max_overhang_deg=max_overhang_deg,
+        )
+
+        # Build DesignIntent
+        intent = DesignIntent(
+            component_type=ComponentType(component_type),
+            keywords=keywords or [],
+            geometry_language=GeometryLanguage(geometry_language),
+            notes=intent_notes,
+        )
+
+        # Assemble brief
+        brief = PhysicsBrief(
+            source_prompt=source_prompt,
+            material=mat,
+            load_cases=lc_list,
+            constraints=con_list,
+            load_combination=LoadCombination(load_combination),
+            failure=failure,
+            intent=intent,
+        )
+
+        errors = brief.validate()
+        if errors:
+            return {
+                "status": "validation_failed",
+                "brief_id": brief.brief_id,
+                "validation_errors": errors,
+                "geometry_hints": {},
+                "derived_geometry": {},
+                "brief_json": brief.to_dict(),
+            }
+
+        # Derive minimum geometry params from each requirement
+        reqs = brief_to_requirements(brief)
+        derived: dict = {}
+        for req in reqs:
+            d = req.derive(brief)
+            for key, val in d.items():
+                # Keep the maximum (most conservative) per key
+                if key not in derived or val > derived[key]:
+                    derived[key] = val
+
+        geo_hints = suggest_geometry(brief)
+
+        brief_dict = brief.to_dict()
+        _BRIEF_STORE[brief.brief_id] = brief_dict
+
+        return {
+            "status": "ok",
+            "brief_id": brief.brief_id,
+            "validation_errors": [],
+            "geometry_hints": geo_hints,
+            "derived_geometry": derived,
+            "brief_json": brief_dict,
+        }
+
+    except Exception:
+        return {"status": "error", "message": traceback.format_exc()}
 
 
 # ===========================================================================
@@ -288,13 +474,13 @@ def run_topopt(
 
         _render_to_file(out_stl_path, out_png_path)
 
-        # physics checks: disc_base only (tipping + stem bending)
+        # physics checks: disc_base only (tipping + section bending)
         if ft == "disc_base":
             reach = float(np.sqrt(load_point_x_mm**2 + load_point_y_mm**2))
             physics = _physics_checks(
                 stl_path=str(out_stl_path),
                 load_mass_g=load_mass_g,
-                arm_reach_mm=reach,
+                load_reach_mm=reach,
                 base_radius_mm=base_radius_mm,
             )
         else:
@@ -325,117 +511,41 @@ def run_topopt(
 def check_physics(
     stl_path: str,
     load_mass_g: float,
-    arm_reach_mm: float,
+    load_reach_mm: float,
     base_radius_mm: float = 48.0,
-    stem_min_radius_mm: float = 7.0,
+    min_section_radius_mm: float = 7.0,
     infill_percent: float = 20.0,
     material_density_g_cm3: float = 1.24,
     material_yield_mpa: float = 55.0,
 ) -> dict:
-    """Run structural physics checks on an STL file.
+    """Run structural physics checks on any disc-base standing part.
 
-    Evaluates tipping stability and stem bending stress at the given
-    operating load.  Returns safety factors and pass/fail per check.
+    Evaluates tipping stability and bending stress at the narrowest
+    cross-section.  Works for any upright part with a disc base and an
+    offset load (stands, posts, columns, arms).
 
     Parameters
     ----------
-    stl_path              : STL to evaluate (absolute or project-relative).
-    load_mass_g           : Operating load [g] (not factored).
-    arm_reach_mm          : Horizontal distance from base axis to load [mm].
-    base_radius_mm        : Base disc radius [mm].
-    stem_min_radius_mm    : Radius at narrowest stem cross-section [mm].
-    infill_percent        : FDM infill % -- affects stand mass (default 20).
-    material_density_g_cm3: Raw filament density [g/cm3] (PLA: 1.24).
-    material_yield_mpa    : Filament yield strength [MPa] (PLA: 55).
+    stl_path               : STL to evaluate (absolute or project-relative).
+    load_mass_g            : Operating load [g] (not factored).
+    load_reach_mm          : Horizontal distance from base centre to load point [mm].
+    base_radius_mm         : Base disc radius [mm].
+    min_section_radius_mm  : Radius at the narrowest load-bearing cross-section [mm].
+    infill_percent         : FDM infill % -- affects part mass (default 20).
+    material_density_g_cm3 : Raw filament density [g/cm3] (PLA: 1.24).
+    material_yield_mpa     : Filament yield strength [MPa] (PLA: 55).
     """
     stl_p = Path(stl_path) if Path(stl_path).is_absolute() else ROOT / stl_path
     return _physics_checks(
         stl_path=str(stl_p),
         load_mass_g=load_mass_g,
-        arm_reach_mm=arm_reach_mm,
+        load_reach_mm=load_reach_mm,
         base_radius_mm=base_radius_mm,
-        stem_min_radius_mm=stem_min_radius_mm,
+        min_section_radius_mm=min_section_radius_mm,
         infill_percent=infill_percent,
         material_density_g_cm3=material_density_g_cm3,
         material_yield_mpa=material_yield_mpa,
     )
-
-
-# ===========================================================================
-# Tool 3 -- parametric base-design generator
-# ===========================================================================
-
-@mcp.tool()
-def generate_holder(
-    base_radius_mm:      float = 48.0,
-    base_height_mm:      float = 14.0,
-    stem_height_mm:      float = 234.0,
-    stem_radius_base_mm: float = 9.0,
-    stem_radius_top_mm:  float = 7.0,
-    arm_reach_mm:        float = 82.0,
-    arm_tip_z_mm:        float = 244.0,
-    arm_radius_mm:       float = 8.5,
-    end_cap_radius_mm:   float = 9.0,
-    resolution_mm:       float = 1.0,
-    out_stl: Optional[str] = None,
-) -> dict:
-    """Generate a parametric headphone-holder STL from design parameters.
-
-    Builds the full holder geometry (base disc + tapered stem + S-curve arm
-    + end cap) via a signed-distance-field union and scikit-image marching
-    cubes.  No picogk / external CAD kernel required.
-
-    The returned dict contains arm_tip_x/y/z_mm and base_radius_mm ready
-    to pass directly into run_topopt or check_physics.
-
-    Parameters
-    ----------
-    base_radius_mm      : Base disc radius [mm].  Larger = more stable.
-    base_height_mm      : Base disc thickness [mm].
-    stem_height_mm      : Height where the arm leaves the stem [mm].
-                          Total stand height is roughly stem_height_mm + 20.
-    stem_radius_base_mm : Stem radius at the base junction [mm].
-    stem_radius_top_mm  : Stem radius at the top junction [mm] (taper).
-    arm_reach_mm        : Horizontal reach of the hook tip [mm].
-    arm_tip_z_mm        : Z-height of the hook tip [mm].
-    arm_radius_mm       : Arm beam radius [mm].
-    end_cap_radius_mm   : End-cap sphere radius [mm].
-    resolution_mm       : SDF grid pitch [mm].  1 mm is a good balance
-                          (~5 s); use 0.5 for a finer mesh (~40 s).
-    out_stl             : Output path.  Default: docs/generated_holder.stl
-    """
-    from picogk_mp.generators.holder import generate_holder_stl
-
-    if out_stl is not None:
-        out_path = Path(out_stl) if Path(out_stl).is_absolute() else ROOT / out_stl
-    else:
-        out_path = DOCS / "generated_holder.stl"
-
-    try:
-        result = generate_holder_stl(
-            base_radius_mm      = base_radius_mm,
-            base_height_mm      = base_height_mm,
-            stem_height_mm      = stem_height_mm,
-            stem_radius_base_mm = stem_radius_base_mm,
-            stem_radius_top_mm  = stem_radius_top_mm,
-            arm_reach_mm        = arm_reach_mm,
-            arm_tip_z_mm        = arm_tip_z_mm,
-            arm_radius_mm       = arm_radius_mm,
-            end_cap_radius_mm   = end_cap_radius_mm,
-            resolution_mm       = resolution_mm,
-            out_stl             = str(out_path),
-        )
-
-        # Render preview
-        png_path = out_path.with_suffix(".png")
-        _render_to_file(out_path, png_path)
-        result["png_path"] = str(png_path)
-
-        return result
-
-    except Exception:
-        import traceback
-        return {"status": "error", "message": traceback.format_exc()}
 
 
 # ===========================================================================
@@ -879,15 +989,15 @@ def run_cfd_thermal(
 def _physics_checks(
     stl_path: str,
     load_mass_g: float,
-    arm_reach_mm: float,
+    load_reach_mm: float,
     base_radius_mm: float = 48.0,
-    stem_min_radius_mm: float = 7.0,
+    min_section_radius_mm: float = 7.0,
     infill_percent: float = 20.0,
     material_density_g_cm3: float = 1.24,
     material_yield_mpa: float = 55.0,
 ) -> dict:
     import trimesh
-    from picogk_mp.physics.checks import TippingCheck, StemBendingCheck
+    from picogk_mp.physics.checks import TippingCheck, SectionBendingCheck
 
     try:
         mesh = trimesh.load(str(stl_path), force="mesh")
@@ -896,19 +1006,19 @@ def _physics_checks(
         return {"status": "error", "message": f"Cannot load STL: {exc}"}
 
     ctx = {
-        "head_mass_g":    load_mass_g,
+        "load_mass_g":    load_mass_g,
         "base_r_mm":      base_radius_mm,
-        "arm_reach_mm":   arm_reach_mm,
+        "load_reach_mm":  load_reach_mm,
         "volume_mm3":     volume_mm3,
         "infill_pct":     infill_percent,
         "density_g_cm3":  material_density_g_cm3,
-        "stem_r_min_mm":  stem_min_radius_mm,
+        "section_r_mm":   min_section_radius_mm,
         "yield_mpa":      material_yield_mpa,
     }
 
     checks_out: dict = {}
     all_passed = True
-    for check in [TippingCheck(), StemBendingCheck()]:
+    for check in [TippingCheck(), SectionBendingCheck()]:
         r = check.evaluate(ctx)
         checks_out[check.name] = {
             "passed":      r.passed,
@@ -923,14 +1033,17 @@ def _physics_checks(
         "status":      "ok",
         "all_passed":  all_passed,
         "volume_mm3":  round(volume_mm3),
-        "stand_mass_g": round(volume_mm3 * (infill_percent / 100)
-                              * material_density_g_cm3 / 1000, 1),
+        "part_mass_g": round(volume_mm3 * (infill_percent / 100)
+                             * material_density_g_cm3 / 1000, 1),
         "checks":      checks_out,
     }
 
 
 def _render_to_file(stl_path: Path, png_path: Path) -> None:
-    """Render STL to PNG via vedo offscreen renderer."""
+    """Render STL to PNG via vedo offscreen renderer.
+
+    Camera is auto-fitted to the mesh bounding box -- works for any geometry.
+    """
     try:
         import vedo
         mesh_v = vedo.load(str(stl_path))
@@ -939,14 +1052,7 @@ def _render_to_file(stl_path: Path, png_path: Path) -> None:
             offscreen=True, size=(1280, 960),
             bg=(35, 35, 46), bg2=(10, 10, 18),
         )
-        plt.add(mesh_v)
-        plt.show()
-        cam = plt.camera
-        cam.SetPosition(65, -480, 295)
-        cam.SetFocalPoint(-21, 0, 138)
-        cam.SetViewUp(0, 0, 1)
-        plt.renderer.ResetCameraClippingRange()
-        plt.render()
+        plt.show(mesh_v, resetcam=True)
         png_path.parent.mkdir(parents=True, exist_ok=True)
         plt.screenshot(str(png_path))
         plt.close()

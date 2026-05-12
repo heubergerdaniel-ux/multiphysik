@@ -21,51 +21,37 @@ Alle Entwürfe MÜSSEN diese Bedingungen erfüllen, bevor ein STL exportiert wir
 | Bruch/Versagen unter Spitzenlast | ≥ 5.0 |
 
 ### Standardlasten (falls nicht anders angegeben)
-- Kopfhörer: 400 g am Arm-Endpunkt
-- Dynamischer Lastfaktor (Anstoßen, Ablegen): 2.0 × statische Last
+- Betriebslast: vom User/Prompt angeben (keine Default-Annahme)
+- Dynamischer Lastfaktor (Stoß, Ablegen): 2.0 × statische Last
 
 ---
 
 ## Stabilitätsprüfung Kippen — Pflichtformel
 
-Vor jedem STL-Export analytisch prüfen:
+Vor jedem STL-Export analytisch prüfen (gilt für alle stehenden Teile mit Basisfläche):
 
 ```
-lever_head  = arm_reach - base_r          [mm]  -- Kipphebelarm Last
-lever_stand = base_r - |CG_x|             [mm]  -- Gegenhebelarm Ständer
-tip_moment  = head_mass * lever_head      [g·mm]
-restore     = stand_mass * lever_stand    [g·mm]
-SF_tip      = restore / tip_moment        [-]   -- muss ≥ 1.5 sein
+lever_load  = load_reach - base_r         [mm]  -- Kipphebelarm Last
+lever_stand = base_r - |CG_x|            [mm]  -- Gegenhebelarm Körper
+tip_moment  = load_mass * lever_load     [g·mm]
+restore     = part_mass * lever_stand    [g·mm]
+SF_tip      = restore / tip_moment       [-]   -- muss ≥ 1.5 sein
 ```
 
-**Bei SF < 1.5: Design ablehnen und Parameter anpassen (base_r, arm_reach, Wandstärke).**
+**Bei SF < 1.5: Design ablehnen und Parameter anpassen (base_r, load_reach, Wandstärke).**
 
 Mindest-Basisradius-Formel (direkt lösbar):
 
 ```
-base_r_min = (head_mass * safety * arm_reach) / (stand_mass + head_mass * safety)
+base_r_min = (load_mass * safety * load_reach) / (part_mass + load_mass * safety)
 ```
-
----
-
-## Geometrische Randbedingungen (Kopfhörerhalter-Referenz)
-
-Gilt für alle Kopfhörerhalter-Varianten als Ausgangspunkt:
-
-| Parameter | Minimum | Referenz | Maximum |
-|---|---|---|---|
-| Gesamthöhe | 220 mm | 255 mm | 320 mm |
-| Basis-Radius | 65 mm | 95 mm | 130 mm |
-| Basis-Höhe | 10 mm | 16 mm | 25 mm |
-| Arm-Reichweite (horizontal) | 60 mm | 80 mm | 100 mm |
-| Stem-Durchmesser (Fuß) | 10 mm | 12 mm | 18 mm |
 
 ---
 
 ## Prozess-Checkliste vor STL-Export
 
-- [ ] Kipp-Sicherheitsfaktor ≥ 1.5 analytisch verifiziert (Wert ausgeben)
-- [ ] Schwächster Querschnitt identifiziert und Biegespannung berechnet
+- [ ] Kipp-SF ≥ 1.5 analytisch verifiziert (nur bei disc_base Teilen mit Lastversatz)
+- [ ] Schwächster Querschnitt identifiziert und Biegespannung ≥ SF 3.0 berechnet
 - [ ] Keine Überhänge > 45° (visuell oder per Slicer-Vorschau)
 - [ ] Mindest-Wandstärke ≥ 1.2 mm überall eingehalten
 - [ ] Volumen und Masse ausgegeben (als Plausibilitätscheck)
