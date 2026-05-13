@@ -205,6 +205,40 @@ def sdf_revolve(
     return profile_fn(pts_2d)
 
 
+def sdf_cylinder_x(
+    pts:       np.ndarray,
+    center_yz: Sequence[float],
+    x_range:   Sequence[float],
+    radius:    float,
+) -> np.ndarray:
+    """x-axis aligned capped cylinder SDF (exact)."""
+    cy, cz = float(center_yz[0]), float(center_yz[1])
+    x0, x1 = float(x_range[0]), float(x_range[1])
+    r      = float(radius)
+    d_r    = np.sqrt((pts[:, 1] - cy)**2 + (pts[:, 2] - cz)**2) - r
+    d_x    = np.maximum(x0 - pts[:, 0], pts[:, 0] - x1)
+    outer  = np.sqrt(np.maximum(d_r, 0)**2 + np.maximum(d_x, 0)**2)
+    inner  = np.minimum(np.maximum(d_r, d_x), 0.0)
+    return outer + inner
+
+
+def sdf_cylinder_y(
+    pts:       np.ndarray,
+    center_xz: Sequence[float],
+    y_range:   Sequence[float],
+    radius:    float,
+) -> np.ndarray:
+    """y-axis aligned capped cylinder SDF (exact)."""
+    cx, cz = float(center_xz[0]), float(center_xz[1])
+    y0, y1 = float(y_range[0]), float(y_range[1])
+    r      = float(radius)
+    d_r    = np.sqrt((pts[:, 0] - cx)**2 + (pts[:, 2] - cz)**2) - r
+    d_y    = np.maximum(y0 - pts[:, 1], pts[:, 1] - y1)
+    outer  = np.sqrt(np.maximum(d_r, 0)**2 + np.maximum(d_y, 0)**2)
+    inner  = np.minimum(np.maximum(d_r, d_y), 0.0)
+    return outer + inner
+
+
 def sdf_pipe(
     pts:        np.ndarray,
     spine:      np.ndarray,

@@ -192,6 +192,7 @@ def brief_to_body_shapes(
     Funktion eine leere Liste zurueck und schreibt eine Warnung.
     """
     try:
+        import numpy as np
         from picogk_mp.shapek.base_shape import (  # type: ignore
             PipeShape, RevolveShape, CylinderShape,
         )
@@ -233,15 +234,15 @@ def brief_to_body_shapes(
             alpha = (1.0 - t) ** (1.0 / 3.0)
             return r_min * alpha + r_tip * (1.0 - alpha)
 
-        radius_mod = LineModulation(_radius_fn)
+        radius_mod = LineModulation(func=_radius_fn)
 
         # Polyline aus dem primaeren Lastfall ableiten
         for lc in brief.load_cases:
             if lc.load_type in (LoadType.FORCE, LoadType.GRAVITY) and lc.application_point:
                 pt = lc.application_point
                 # Arm laeuft vom Ursprung zum Angriffspunkt
-                polyline = [(0.0, 0.0, 0.0), (pt[0], pt[1], pt[2])]
-                shapes.append(PipeShape(polyline=polyline, radius_mod=radius_mod))
+                spine = np.array([(0.0, 0.0, 0.0), (pt[0], pt[1], pt[2])])
+                shapes.append(PipeShape(spine=spine, radius_mod=radius_mod))
                 break
 
     else:
@@ -251,9 +252,9 @@ def brief_to_body_shapes(
                 d = lc.direction
                 length = r_min * 10   # Schaetzlaenge
                 shapes.append(PipeShape(
-                    polyline=[(0.0, 0.0, 0.0),
-                               (d[0]*length, d[1]*length, d[2]*length)],
-                    radius_mod=LineModulation(r_min),
+                    spine=np.array([(0.0, 0.0, 0.0),
+                                    (d[0]*length, d[1]*length, d[2]*length)]),
+                    radius_mod=LineModulation(value=r_min),
                 ))
                 break
 

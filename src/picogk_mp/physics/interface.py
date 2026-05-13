@@ -150,6 +150,65 @@ def _cylinder_cut_dict(position: List[float], axis: str,
     }
 
 
+def interface_to_shapek_cuts(f: InterfaceFeature) -> List[Any]:
+    """Wandelt ein InterfaceFeature in ShapeKernel-BaseShape-Schnitte um.
+
+    Gibt eine Liste von BaseShape-Objekten zurueck (CylinderXShape, CylinderYShape
+    oder CylinderShape), die als DifferenceShape vom Koerper subtrahiert werden.
+    Jedes Objekt hat positives SDF innen (Bohrungszylinder).
+
+    Verwendung::
+
+        from picogk_mp.shapek.base_shape import CompoundShape, DifferenceShape
+        body = CompoundShape(plate, arm, ...)
+        for cut in interface_to_shapek_cuts(feature):
+            body = DifferenceShape(body, cut)
+        result = body.mesh_stl(resolution_mm=1.5)
+    """
+    try:
+        from picogk_mp.shapek.base_shape import (  # type: ignore
+            CylinderShape, CylinderXShape, CylinderYShape,
+        )
+    except ImportError as exc:
+        raise ImportError(
+            "picogk_mp.shapek ist nicht verfuegbar -- "
+            "interface_to_shapek_cuts() benoetigt ShapeKernel"
+        ) from exc
+
+    cuts: List[Any] = []
+    x, y, z = float(f.position[0]), float(f.position[1]), float(f.position[2])
+
+    if f.feature_type == InterfaceType.PRESS_FIT:
+        d_bore = f.diameter_mm - f.interference_mm
+    else:
+        d_bore = f.diameter_mm + f.clearance_mm
+    r_bore = d_bore / 2.0
+    half   = f.depth_mm / 2.0
+
+    if f.axis == "x":
+        cuts.append(CylinderXShape([y, z], [x - half, x + half], r_bore))
+    elif f.axis == "y":
+        cuts.append(CylinderYShape([x, z], [y - half, y + half], r_bore))
+    else:
+        cuts.append(CylinderShape([x, y], [z - half, z + half], r_bore))
+
+    # Counterbore (Senkung)
+    if f.counterbore_d_mm is not None and f.counterbore_depth_mm is not None:
+        r_cb    = float(f.counterbore_d_mm) / 2.0
+        half_cb = float(f.counterbore_depth_mm) / 2.0
+        if f.axis == "x":
+            cb_x0 = x - half + half_cb
+            cuts.append(CylinderXShape([y, z], [cb_x0 - half_cb, cb_x0 + half_cb], r_cb))
+        elif f.axis == "y":
+            cb_y0 = y - half + half_cb
+            cuts.append(CylinderYShape([x, z], [cb_y0 - half_cb, cb_y0 + half_cb], r_cb))
+        else:
+            cb_z0 = z - half + half_cb
+            cuts.append(CylinderShape([x, y], [cb_z0 - half_cb, cb_z0 + half_cb], r_cb))
+
+    return cuts
+
+
 def interface_to_cut_primitives(f: InterfaceFeature) -> List[Dict[str, Any]]:
     """Wandelt ein InterfaceFeature in Cut-Primitive-Dicts fuer generate_shape_stl um.
 

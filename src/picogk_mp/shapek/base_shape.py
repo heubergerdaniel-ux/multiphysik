@@ -252,6 +252,56 @@ class CylinderShape(BaseShape):
         )
 
 
+class CylinderXShape(BaseShape):
+    """x-axis aligned capped cylinder (for screw holes along x)."""
+
+    def __init__(
+        self,
+        center_yz: Sequence[float],
+        x_range:   Sequence[float],
+        radius:    float,
+    ) -> None:
+        self._cyz = (float(center_yz[0]), float(center_yz[1]))
+        self._x   = (float(x_range[0]), float(x_range[1]))
+        self._r   = float(radius)
+
+    def sdf_at_points(self, pts):
+        from picogk_mp.shapek.primitives import sdf_cylinder_x
+        return sdf_cylinder_x(pts, self._cyz, self._x, self._r)
+
+    def bounds(self):
+        r = self._r + 1
+        return (
+            np.array([self._x[0]-1,     self._cyz[0]-r, self._cyz[1]-r]),
+            np.array([self._x[1]+1,     self._cyz[0]+r, self._cyz[1]+r]),
+        )
+
+
+class CylinderYShape(BaseShape):
+    """y-axis aligned capped cylinder (for screw holes along y)."""
+
+    def __init__(
+        self,
+        center_xz: Sequence[float],
+        y_range:   Sequence[float],
+        radius:    float,
+    ) -> None:
+        self._cxz = (float(center_xz[0]), float(center_xz[1]))
+        self._y   = (float(y_range[0]), float(y_range[1]))
+        self._r   = float(radius)
+
+    def sdf_at_points(self, pts):
+        from picogk_mp.shapek.primitives import sdf_cylinder_y
+        return sdf_cylinder_y(pts, self._cxz, self._y, self._r)
+
+    def bounds(self):
+        r = self._r + 1
+        return (
+            np.array([self._cxz[0]-r, self._y[0]-1,     self._cxz[1]-r]),
+            np.array([self._cxz[0]+r, self._y[1]+1,     self._cxz[1]+r]),
+        )
+
+
 class ConeShape(BaseShape):
     def __init__(
         self,
