@@ -470,6 +470,162 @@ class DragRequirement(PhysicsRequirement):
 
 
 # ======================================================================
+# ScrewBearingRequirement
+# ======================================================================
+
+class ScrewBearingRequirement(PhysicsRequirement):
+    """Lochleibungsnachweis: Schraube drueckt in PLA-Loch (Flachpressung).
+
+    sigma_bearing = F_total / (n_screws * d_screw * t_plate)  [MPa]
+    SF_bearing    = sigma_yield / sigma_bearing
+
+    Versagensmodus: Abscheren/Quetschen des PLA-Materials am Schraubenrand.
+    Konservativ (keine Reibungsreserve, keine Gewindetraegheit).
+
+    required_params: load_mass_g, n_screws, screw_d_mm, plate_t_mm, yield_mpa
+    """
+
+    name = "Lochleibung (Schraubenanschluss)"
+    sf_required = 2.0
+    required_params = ("load_mass_g", "n_screws", "screw_d_mm", "plate_t_mm", "yield_mpa")
+
+    def derive(self, brief: "PhysicsBrief") -> dict:
+        """Leitet Mindest-Plattendicke fuer 4x M6 Schrauben ab (Standardannahme)."""
+        from picogk_mp.physics.interface import InterfaceType as IT
+        F_N   = self._primary_force_N(brief)
+        if F_N <= 0:
+            return {}
+        sig_y = brief.material.resolved("yield_mpa")
+
+        # Schraubenparameter aus InterfaceFeatures extrahieren, sonst Standardwerte
+        screw_ifaces = [
+            f for f in brief.interfaces
+            if f.feature_type in (IT.SCREW_THROUGH, IT.THREADED_INSERT)
+        ]
+        n_screws   = sum(f.n_count for f in screw_ifaces) if screw_ifaces else 4
+        d_screw_mm = min(f.diameter_mm for f in screw_ifaces) if screw_ifaces else 6.0
+
+        # Mindest-Plattendicke: sigma_bearing = F / (n * d * t) <= sigma_y / SF
+        t_min = F_N * self.sf_required / (n_screws * d_screw_mm * sig_y)
+        return {
+            "plate_t_min_mm": round(t_min, 2),
+            "n_screws":       n_screws,
+            "screw_d_mm":     d_screw_mm,
+        }
+
+    def verify(self, ctx: Dict[str, Any]) -> RequirementResult:
+        self._verify_ctx(ctx)
+        F_N     = ctx["load_mass_g"] * 9.81e-3   # N
+        n       = float(ctx["n_screws"])
+        d       = float(ctx["screw_d_mm"])
+        t       = float(ctx["plate_t_mm"])
+        sig_y   = float(ctx["yield_mpa"])
+
+        sigma_b = F_N / (n * d * t) if (n * d * t) > 0 else float("inf")
+        sf      = sig_y / sigma_b if sigma_b > 0 else float("inf")
+
+        detail = (
+            f"SF={sf:.1f} (Mindest {self.sf_required})  |  "
+            f"sigma_bearing={sigma_b:.2f} MPa  "
+            f"(F={F_N:.1f} N, n={n:.0f}, d={d} mm, t={t} mm)"
+        )
+        return RequirementResult(self.name, sf >= self.sf_required, sf, self.sf_required, detail)
+
+
+# ======================================================================
+# PressFitRetentionRequirement
+# ======================================================================
+
+class PressFitRetentionRequirement(PhysicsRequirement):
+    """Haltekraft einer Presspassung (vereinfachte Lame-Formel, gleiches Material).
+
+    Fugendruck (duennwandige Nabe, gleiches Material):
+        p = E * (delta / d) * K_hub          [MPa]
+        K_hub = (D_hub^2 - d^2) / D_hub^2   [-]
+
+    Axiale Haltekraft durch Reibung:
+        F_ret = mu * p * pi * d * L          [N]
+        SF_retention = F_ret / F_axial
+
+    required_params: E_mpa, interference_mm, shaft_d_mm, hub_outer_d_mm,
+                     engagement_l_mm, axial_force_N
+    """
+
+    name = "Passfugen-Haltekraft (Presspassung)"
+    sf_required = 2.0
+    required_params = (
+        "E_mpa", "interference_mm", "shaft_d_mm",
+        "hub_outer_d_mm", "engagement_l_mm", "axial_force_N",
+    )
+
+    def derive(self, brief: "PhysicsBrief") -> dict:
+        """Leitet Mindest-Uebermas und -Eingriffslange ab."""
+        from picogk_mp.physics.interface import InterfaceType as IT
+        press_ifaces = [f for f in brief.interfaces if f.feature_type == IT.PRESS_FIT]
+        if not press_ifaces:
+            return {}
+
+        F_axial = self._primary_force_N(brief)
+        if F_axial <= 0:
+            return {}
+
+        f = press_ifaces[0]   # erstes Press-Fit als Referenz
+        E_mpa     = brief.material.resolved("E_mpa")
+        d         = f.diameter_mm
+        D_hub     = f.hub_outer_d_mm or (d * 2.0)
+        mu        = f.mu_friction
+        L         = f.depth_mm
+
+        K_hub  = (D_hub**2 - d**2) / D_hub**2
+        if K_hub <= 0:
+            return {}
+
+        # Mindest-delta sodass F_ret >= SF * F_axial
+        # F_ret = mu * p * pi * d * L = mu * E*(delta/d)*K_hub * pi*d*L
+        # delta_min = SF * F_axial / (mu * E * K_hub * pi * L)
+        delta_min = (
+            self.sf_required * F_axial
+            / (mu * E_mpa * K_hub * math.pi * L)
+        )
+
+        # Mindest-Eingriffslange bei vorhandenem delta
+        delta    = f.interference_mm if f.interference_mm > 0 else delta_min
+        p_actual = E_mpa * (delta / d) * K_hub
+        L_min    = (
+            self.sf_required * F_axial
+            / (mu * p_actual * math.pi * d)
+        ) if (mu * p_actual * math.pi * d) > 0 else 0.0
+
+        return {
+            "interference_min_mm":  round(delta_min, 3),
+            "engagement_l_min_mm":  round(L_min, 1),
+        }
+
+    def verify(self, ctx: Dict[str, Any]) -> RequirementResult:
+        self._verify_ctx(ctx)
+        E_mpa    = float(ctx["E_mpa"])
+        delta    = float(ctx["interference_mm"])
+        d        = float(ctx["shaft_d_mm"])
+        D_hub    = float(ctx["hub_outer_d_mm"])
+        L        = float(ctx["engagement_l_mm"])
+        F_axial  = float(ctx["axial_force_N"])
+        mu       = float(ctx.get("mu_friction", 0.30))
+
+        K_hub  = (D_hub**2 - d**2) / D_hub**2 if D_hub > d else 0.0
+        p      = E_mpa * (delta / d) * K_hub if d > 0 else 0.0
+        F_ret  = mu * p * math.pi * d * L
+        sf     = F_ret / F_axial if F_axial > 0 else float("inf")
+
+        detail = (
+            f"SF={sf:.1f} (Mindest {self.sf_required})  |  "
+            f"Fugendruck p={p:.2f} MPa  "
+            f"Haltekraft F_ret={F_ret:.1f} N  "
+            f"(delta={delta} mm, d={d} mm, L={L} mm, mu={mu})"
+        )
+        return RequirementResult(self.name, sf >= self.sf_required, sf, self.sf_required, detail)
+
+
+# ======================================================================
 # Aliase fuer Rueckwaertskompatibilitaet
 # ======================================================================
 

@@ -338,6 +338,7 @@ class PhysicsBrief:
     load_combination: LoadCombination = LoadCombination.AND
     failure:          FailureCriteria = field(default_factory=FailureCriteria)
     intent:           DesignIntent    = field(default_factory=DesignIntent)
+    interfaces:       "List[Any]"     = field(default_factory=list)  # List[InterfaceFeature]
     brief_id:         str             = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
     # ------------------------------------------------------------------
@@ -388,6 +389,7 @@ class PhysicsBrief:
     # ------------------------------------------------------------------
 
     def to_dict(self) -> Dict[str, Any]:
+        from picogk_mp.physics.interface import InterfaceFeature as _IF
         return {
             "brief_id":        self.brief_id,
             "source_prompt":   self.source_prompt,
@@ -397,10 +399,13 @@ class PhysicsBrief:
             "constraints":     [c.to_dict() for c in self.constraints],
             "failure":         self.failure.to_dict(),
             "intent":          self.intent.to_dict(),
+            "interfaces":      [f.to_dict() if isinstance(f, _IF) else f for f in self.interfaces],
         }
 
     @classmethod
     def from_dict(cls, data: Dict[str, Any]) -> "PhysicsBrief":
+        from picogk_mp.physics.interface import InterfaceFeature as _IF
+        ifaces = [_IF.from_dict(f) for f in data.get("interfaces", [])]
         obj = cls(
             source_prompt=data.get("source_prompt", ""),
             material=Material.from_dict(data.get("material", {})),
@@ -409,6 +414,7 @@ class PhysicsBrief:
             load_combination=LoadCombination(data.get("load_combination", "AND")),
             failure=FailureCriteria.from_dict(data.get("failure", {})),
             intent=DesignIntent.from_dict(data.get("intent", {})),
+            interfaces=ifaces,
         )
         if "brief_id" in data:
             obj.brief_id = data["brief_id"]

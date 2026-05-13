@@ -95,17 +95,45 @@ def _cylinder(pts: np.ndarray, center_xy, z_range, radius: float) -> np.ndarray:
     return outer + inner
 
 
+def _cylinder_x(pts: np.ndarray, center_yz, x_range, radius: float) -> np.ndarray:
+    """x-axis aligned capped cylinder (for screw holes along x)."""
+    cy, cz = float(center_yz[0]), float(center_yz[1])
+    x0, x1 = float(x_range[0]), float(x_range[1])
+    r = float(radius)
+    d_r = np.sqrt((pts[:, 1] - cy)**2 + (pts[:, 2] - cz)**2) - r
+    d_x = np.maximum(x0 - pts[:, 0], pts[:, 0] - x1)
+    outer = np.sqrt(np.maximum(d_r, 0)**2 + np.maximum(d_x, 0)**2)
+    inner = np.minimum(np.maximum(d_r, d_x), 0.0)
+    return outer + inner
+
+
+def _cylinder_y(pts: np.ndarray, center_xz, y_range, radius: float) -> np.ndarray:
+    """y-axis aligned capped cylinder (for screw holes along y)."""
+    cx, cz = float(center_xz[0]), float(center_xz[1])
+    y0, y1 = float(y_range[0]), float(y_range[1])
+    r = float(radius)
+    d_r = np.sqrt((pts[:, 0] - cx)**2 + (pts[:, 2] - cz)**2) - r
+    d_y = np.maximum(y0 - pts[:, 1], pts[:, 1] - y1)
+    outer = np.sqrt(np.maximum(d_r, 0)**2 + np.maximum(d_y, 0)**2)
+    inner = np.minimum(np.maximum(d_r, d_y), 0.0)
+    return outer + inner
+
+
 _DISPATCH = {
-    "sphere":   lambda pts, p: _sphere(pts,
-                    p["center"], p["radius"]),
-    "box":      lambda pts, p: _box(pts,
-                    p["min"], p["max"]),
-    "capsule":  lambda pts, p: _capsule(pts,
-                    p["from"], p["to"],
-                    p.get("radius_from", p.get("radius", 5.0)),
-                    p.get("radius_to",   p.get("radius", 5.0))),
-    "cylinder": lambda pts, p: _cylinder(pts,
-                    p["center_xy"], p["z_range"], p["radius"]),
+    "sphere":     lambda pts, p: _sphere(pts,
+                      p["center"], p["radius"]),
+    "box":        lambda pts, p: _box(pts,
+                      p["min"], p["max"]),
+    "capsule":    lambda pts, p: _capsule(pts,
+                      p["from"], p["to"],
+                      p.get("radius_from", p.get("radius", 5.0)),
+                      p.get("radius_to",   p.get("radius", 5.0))),
+    "cylinder":   lambda pts, p: _cylinder(pts,
+                      p["center_xy"], p["z_range"], p["radius"]),
+    "cylinder_x": lambda pts, p: _cylinder_x(pts,
+                      p["center_yz"], p["x_range"], p["radius"]),
+    "cylinder_y": lambda pts, p: _cylinder_y(pts,
+                      p["center_xz"], p["y_range"], p["radius"]),
 }
 
 
@@ -143,6 +171,16 @@ def _primitive_bounds(p: dict[str, Any]) -> tuple[np.ndarray, np.ndarray]:
         c = np.array(p["center"], dtype=float)
         extent = float(p["major_r"]) + float(p["minor_r"])
         return c - extent, c + extent
+    if t == "cylinder_x":
+        cy, cz = p["center_yz"]
+        x0, x1 = p["x_range"]
+        r = float(p["radius"])
+        return np.array([x0, cy-r, cz-r]), np.array([x1, cy+r, cz+r])
+    if t == "cylinder_y":
+        cx, cz = p["center_xz"]
+        y0, y1 = p["y_range"]
+        r = float(p["radius"])
+        return np.array([cx-r, y0, cz-r]), np.array([cx+r, y1, cz+r])
     raise ValueError(f"Unknown primitive type: '{t}'")
 
 
@@ -184,11 +222,18 @@ def generate_shape_stl(
 
     t0 = time.time()
 
-    # Union bounding box (+ padding so MC boundary is always void)
+    # Classify into add (union) vs cut (subtraction)
+    add_prims = [p for p in primitives if p.get("mode", "add") != "cut"]
+    cut_prims = [p for p in primitives if p.get("mode", "add") == "cut"]
+
+    if not add_prims:
+        return {"status": "error", "message": "No non-cut primitives provided."}
+
+    # Union bounding box — cut primitives do NOT expand the bounds
     pad = 10.0
     mn = np.array([np.inf,  np.inf,  np.inf])
     mx = np.array([-np.inf, -np.inf, -np.inf])
-    for p in primitives:
+    for p in add_prims:
         lo, hi = _primitive_bounds(p)
         mn = np.minimum(mn, lo)
         mx = np.maximum(mx, hi)
@@ -201,20 +246,26 @@ def generate_shape_stl(
     zs = np.arange(mn[2], mx[2] + res, res)
     Nx, Ny, Nz = len(xs), len(ys), len(zs)
 
+    n_cuts = len(cut_prims)
     print(
         f"Generating shape SDF at {res} mm: "
         f"{Nx} x {Ny} x {Nz} = {Nx*Ny*Nz:,} pts, "
-        f"{len(primitives)} primitive(s) ..."
+        f"{len(add_prims)} solid + {n_cuts} cut primitive(s) ..."
     )
 
     X, Y, Z = np.meshgrid(xs, ys, zs, indexing="ij")
     pts = np.stack([X.ravel(), Y.ravel(), Z.ravel()], axis=1)
 
-    # Union of all primitives
+    # 1. Union of all solid primitives
     sdf = np.full(len(pts), np.inf)
-    for p in primitives:
+    for p in add_prims:
         fn = _DISPATCH[p["type"].lower()]
         sdf = np.minimum(sdf, fn(pts, p))
+
+    # 2. Boolean subtraction: sdf = max(sdf_solid, -sdf_cut)
+    for p in cut_prims:
+        fn = _DISPATCH[p["type"].lower()]
+        sdf = np.maximum(sdf, -fn(pts, p))
 
     sdf = sdf.reshape(Nx, Ny, Nz)
 

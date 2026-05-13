@@ -1,16 +1,18 @@
 """Physics Brief Mapper — uebersetzt PhysicsBrief in Laufzeitobjekte.
 
 Funktionen:
-    brief_to_requirements(brief)   -> list[PhysicsRequirement]
-    brief_to_sim_engine(brief)     -> SimEngine
-    brief_to_boundary_conditions(brief, Nx, Ny, Nz, h, offset) -> BoundaryConditions
-    brief_to_topopt_kwargs(brief)  -> dict
-    suggest_geometry(brief)        -> dict
+    brief_to_requirements(brief)              -> list[PhysicsRequirement]
+    brief_to_interface_primitives(brief)      -> list[dict]
+    brief_to_body_shapes(brief, derived)      -> list[BaseShape]
+    brief_to_sim_engine(brief)                -> SimEngine
+    brief_to_boundary_conditions(brief, ...) -> BoundaryConditions
+    brief_to_topopt_kwargs(brief)             -> dict
+    suggest_geometry(brief)                   -> dict
 """
 from __future__ import annotations
 
 import math
-from typing import TYPE_CHECKING, List, Optional, Sequence
+from typing import TYPE_CHECKING, Any, Dict, List, Optional, Sequence
 
 from picogk_mp.physics.brief import (
     ComponentType, ConstraintType, DesignIntent,
@@ -21,9 +23,15 @@ from picogk_mp.physics.requirement import (
     BucklingRequirement,
     DragRequirement,
     PhysicsRequirement,
+    PressFitRetentionRequirement,
+    ScrewBearingRequirement,
     TensionRequirement,
     TippingRequirement,
     TorsionRequirement,
+)
+from picogk_mp.physics.interface import (
+    InterfaceType as _IT,
+    interface_to_cut_primitives,
 )
 from picogk_mp.physics.params import Param
 from picogk_mp.physics.engine import SimEngine
@@ -95,6 +103,15 @@ def brief_to_requirements(brief: PhysicsBrief) -> List[PhysicsRequirement]:
         req.sf_required = brief.failure.sf_tension
         reqs.append(req)
 
+    # Lochleibung: wenn Schrauben-Interfaces vorhanden
+    screw_types = (_IT.SCREW_THROUGH, _IT.THREADED_INSERT)
+    if any(f.feature_type in screw_types for f in getattr(brief, "interfaces", [])):
+        reqs.append(ScrewBearingRequirement())
+
+    # Passfugendruck: wenn Presspassungs-Interfaces vorhanden
+    if any(f.feature_type == _IT.PRESS_FIT for f in getattr(brief, "interfaces", [])):
+        reqs.append(PressFitRetentionRequirement())
+
     return reqs
 
 
@@ -122,6 +139,128 @@ def _arm_reach_mm(brief: PhysicsBrief) -> float:
 
 
 # ======================================================================
+# brief_to_interface_primitives
+# ======================================================================
+
+def brief_to_interface_primitives(brief: PhysicsBrief) -> List[Dict[str, Any]]:
+    """Erzeugt Cut-Primitive-Dicts fuer generate_shape_stl aus allen InterfaceFeatures.
+
+    Gibt eine Liste von Primitive-Dicts zurueck, jedes mit ``"mode": "cut"``.
+    Uebergabe direkt an generate_shape_stl:
+
+        solid_prims = [...]          # Koerperprimitiven
+        cuts = brief_to_interface_primitives(brief)
+        result = generate_shape_stl(solid_prims + cuts, resolution_mm=1.5)
+    """
+    cuts: List[Dict[str, Any]] = []
+    for f in getattr(brief, "interfaces", []):
+        cuts.extend(interface_to_cut_primitives(f))
+    return cuts
+
+
+# ======================================================================
+# brief_to_body_shapes
+# ======================================================================
+
+def brief_to_body_shapes(
+    brief: PhysicsBrief,
+    derived: Dict[str, Any],
+) -> list:
+    """Erzeugt mathematisch beschriebene Koerper-Shapes aus Brief + derive()-Ergebnis.
+
+    Gibt eine Liste von BaseShape-Objekten zurueck (PipeShape, RevolveShape, ...).
+    Kann direkt in CompoundShape / DifferenceShape weiterverarbeitet werden.
+
+    Entscheidungslogik nach dominantem LoadType
+    -------------------------------------------
+    FORCE / GRAVITY mit Hebelarm  -> PipeShape mit Momentenverjuengung
+                                     r(t) = r_min*(1-t)^(1/3)   (Euler-Bernoulli)
+    FORCE / GRAVITY axial         -> CylinderShape (Zugstange)
+    TORSION                       -> RevolveShape Hohlzylinder
+    PRESSURE                      -> RevolveShape Gewoelbe/Kuppel
+    Fallback                      -> PipeShape konstanter Radius
+
+    Parameter
+    ---------
+    derived : dict aus PhysicsRequirement.derive(brief), mindestens:
+        section_r_min_mm  -- Mindestquerschnittsradius [mm]
+        (weitere Schlussel werden ignoriert)
+
+    Hinweis
+    -------
+    ShapeKernel (picogk_mp.shapek) ist optional.  Fehlt das Paket, gibt die
+    Funktion eine leere Liste zurueck und schreibt eine Warnung.
+    """
+    try:
+        from picogk_mp.shapek.base_shape import (  # type: ignore
+            PipeShape, RevolveShape, CylinderShape,
+        )
+        from picogk_mp.shapek.modulation import LineModulation  # type: ignore
+    except ImportError:
+        import warnings
+        warnings.warn(
+            "picogk_mp.shapek nicht verfuegbar -- brief_to_body_shapes gibt [] zurueck.",
+            stacklevel=2,
+        )
+        return []
+
+    r_min: float = float(derived.get("section_r_min_mm", 10.0))
+    r_tip: float = max(r_min * 0.4, 4.0)   # Spitze: 40% von r_min, mind. 4 mm
+
+    load_types = {lc.load_type for lc in brief.load_cases}
+    shapes: list = []
+
+    if LoadType.PRESSURE in load_types:
+        # Gewoelbe: Rotation eines Kreisbogens um die z-Achse
+        profile = [(0.0, r_min), (r_min * 0.7, r_min * 0.7), (r_min, 0.0)]
+        shapes.append(RevolveShape(profile=profile, axis="z"))
+
+    elif LoadType.TORSION in load_types:
+        # Hohlzylinder: minimiert Schubspannung
+        reach = _arm_reach_mm(brief) or (r_min * 10)
+        shapes.append(CylinderShape(
+            radius_outer=r_min,
+            radius_inner=r_min * 0.6,
+            length=reach,
+        ))
+
+    elif _arm_reach_mm(brief) > 0:
+        # Biegearm mit Momentenverjuengung (Euler-Bernoulli)
+        # M(t) = F*(1-t)*L  =>  r(t) proportional M^(1/3)
+        # r(t=0) = r_min  (volle Einspannung), r(t=1) = r_tip (freies Ende)
+        def _radius_fn(t: float) -> float:
+            # (1-t)^(1/3) von 1 nach 0; interpoliert zwischen r_min und r_tip
+            alpha = (1.0 - t) ** (1.0 / 3.0)
+            return r_min * alpha + r_tip * (1.0 - alpha)
+
+        radius_mod = LineModulation(_radius_fn)
+
+        # Polyline aus dem primaeren Lastfall ableiten
+        for lc in brief.load_cases:
+            if lc.load_type in (LoadType.FORCE, LoadType.GRAVITY) and lc.application_point:
+                pt = lc.application_point
+                # Arm laeuft vom Ursprung zum Angriffspunkt
+                polyline = [(0.0, 0.0, 0.0), (pt[0], pt[1], pt[2])]
+                shapes.append(PipeShape(polyline=polyline, radius_mod=radius_mod))
+                break
+
+    else:
+        # Axiale Zugstange: konstanter Kreisquerschnitt
+        for lc in brief.load_cases:
+            if lc.load_type in (LoadType.FORCE, LoadType.GRAVITY) and lc.direction:
+                d = lc.direction
+                length = r_min * 10   # Schaetzlaenge
+                shapes.append(PipeShape(
+                    polyline=[(0.0, 0.0, 0.0),
+                               (d[0]*length, d[1]*length, d[2]*length)],
+                    radius_mod=LineModulation(r_min),
+                ))
+                break
+
+    return shapes
+
+
+# ======================================================================
 # brief_to_sim_engine
 # ======================================================================
 
@@ -133,7 +272,14 @@ def brief_to_sim_engine(brief: PhysicsBrief) -> SimEngine:
 
     Geometrie-Params (unaufgeloest, via inject() zu befuellen):
         base_r_mm, load_reach_mm, volume_mm3, section_r_mm
+
+    Interface-Params (aus InterfaceFeatures, falls vorhanden):
+        n_screws, screw_d_mm, plate_t_mm            -- bei SCREW_THROUGH / THREADED_INSERT
+        interference_mm, shaft_d_mm, hub_outer_d_mm,
+        engagement_l_mm, axial_force_N, mu_friction  -- bei PRESS_FIT
     """
+    from picogk_mp.physics.interface import screw_bearing_params, press_fit_params
+
     # Primaere Kraft als Betriebslast
     primary_force_N = 0.0
     for lc in brief.load_cases:
@@ -142,13 +288,33 @@ def brief_to_sim_engine(brief: PhysicsBrief) -> SimEngine:
 
     load_mass_g = primary_force_N / 9.81 * 1000 if primary_force_N > 0 else 0.0
 
-    resolver = {
+    resolver: Dict[str, Any] = {
         "load_mass_g":    load_mass_g,
         "yield_mpa":      brief.material.resolved("yield_mpa"),
         "density_g_cm3":  brief.material.resolved("density_g_cm3"),
         "infill_pct":     brief.material.infill_pct,
         "E_mpa":          brief.material.resolved("E_mpa"),
     }
+
+    # Pre-populate screw-bearing params from InterfaceFeatures so they don't
+    # need to be injected manually by the caller.
+    ifaces = getattr(brief, "interfaces", [])
+    screw_types = (_IT.SCREW_THROUGH, _IT.THREADED_INSERT)
+    has_screws = any(f.feature_type in screw_types for f in ifaces)
+    has_press  = any(f.feature_type == _IT.PRESS_FIT for f in ifaces)
+
+    if has_screws:
+        sbp = screw_bearing_params(ifaces)
+        if sbp:
+            resolver.update(sbp)   # n_screws, screw_d_mm, plate_t_mm
+
+    if has_press:
+        pf = next(f for f in ifaces if f.feature_type == _IT.PRESS_FIT)
+        pfp = press_fit_params(pf)
+        resolver.update(pfp)       # interference_mm, shaft_d_mm, hub_outer_d_mm, ...
+        # axial_force_N: use design load if not specified
+        if "axial_force_N" not in resolver:
+            resolver["axial_force_N"] = primary_force_N
 
     engine = SimEngine(resolver=resolver)
     engine.register(
@@ -164,6 +330,25 @@ def brief_to_sim_engine(brief: PhysicsBrief) -> SimEngine:
         Param("section_r_mm",       "Querschnitt r",     unit="mm"),
         Param("buckling_length_mm", "Knicklange",        unit="mm"),
     )
+
+    # Schrauben-Lochleibungsparameter registrieren
+    if has_screws:
+        engine.register(
+            Param("n_screws",   "Schraubenanzahl",    unit=""),
+            Param("screw_d_mm", "Schraubendurchm.",   unit="mm", lo=1.0),
+            Param("plate_t_mm", "Plattendicke",       unit="mm", lo=0.1),
+        )
+
+    # Presspassungsparameter registrieren
+    if has_press:
+        engine.register(
+            Param("interference_mm",  "Uebermas",          unit="mm"),
+            Param("shaft_d_mm",       "Wellendurchm.",      unit="mm", lo=1.0),
+            Param("hub_outer_d_mm",   "Nabenaussend.",      unit="mm", lo=1.0),
+            Param("engagement_l_mm",  "Eingriffslaenge",    unit="mm", lo=0.1),
+            Param("axial_force_N",    "Axiallast",          unit="N",  lo=0.0),
+            Param("mu_friction",      "Haftreibungszahl",   unit=""),
+        )
 
     for req in brief_to_requirements(brief):
         engine.add_check(req)
