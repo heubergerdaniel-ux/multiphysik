@@ -7,7 +7,8 @@ Public API
 ----------
 TopoptPipeline          -- end-to-end STL-in / STL-out optimisation runner
 BoundaryConditions      -- container for fixed DOFs + force vector
-BoundaryConditions.headphone_holder  -- convenience constructor for stands
+BoundaryConditions.disc_base_with_tip_load  -- convenience constructor for
+                                               disc-base parts under offset load
 element_stiffness       -- 24x24 Hex8 stiffness matrix (for unit tests)
 """
 from picogk_mp.topopt.pipeline   import TopoptPipeline
