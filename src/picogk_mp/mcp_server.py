@@ -19,10 +19,16 @@ Registration (project-level .mcp.json)
 Tools
 -----
 generate_shape   Build any geometry from SDF primitives (sphere/box/capsule/cylinder)
+generate_shapek  ShapeKernel-extended primitives (cone, torus, pipe)
 run_topopt       BESO topology optimisation -- works on ANY STL with flexible BCs
-check_physics    Structural safety-factor checks (tipping + bending) on disc-base parts
+check_physics    Structural safety-factor checks (tipping + cantilever bending)
+                 for disc-base parts under offset load
 render_stl       STL -> inline PNG preview
 list_stls        Discover STL files in the project
+measure_shape    Volume, mass, CoG, inertia tensor of an STL
+generate_lattice Beam-based engineering lattice infill
+run_cfd_flow     2D external-flow LBM solver (Cd, Re, pressure drop)
+run_cfd_thermal  Convective cooling LBM solver (h_conv, temperature field)
 
 Workflow (Claude's role)
 ------------------------
@@ -68,9 +74,9 @@ mcp = FastMCP(
         "6. generate_lattice for beam-based infill (requires picogk.go). "
         "7. run_cfd_flow for aerodynamic drag (Cd, Re, velocity field). "
         "8. run_cfd_thermal for convective cooling (h_conv, temperature field). "
-        "\n\nExamples of what you can build: headphone stand, wall bracket, "
-        "shelf arm, hook, drone frame, furniture joint, structural node, "
-        "ring/torus structures, tapered pipes, any custom mechanical part. "
+        "\n\nExamples of what you can build: stands, brackets, hooks, shelf arms, "
+        "drone frames, furniture joints, structural nodes, ring/torus structures, "
+        "tapered pipes -- any custom mechanical part. "
         "\n\nAlways render after generate or optimise. "
         "list_stls finds existing files."
     ),
@@ -98,8 +104,8 @@ def generate_shape(
 
     Builds watertight geometry by taking the SDF union of all primitives
     and extracting a surface with marching cubes.  Works for ANY part:
-    headphone stands, wall brackets, hooks, drone frames, furniture joints,
-    structural nodes, custom tools -- anything describable with primitives.
+    stands, brackets, hooks, drone frames, furniture joints, structural
+    nodes, custom tools -- anything describable with primitives.
 
     Primitive types (all coordinates in mm)
     ----------------------------------------
@@ -183,8 +189,8 @@ def run_topopt(
 ) -> dict:
     """Run BESO topology optimisation on any 3D-printed structural part.
 
-    Works with any STL geometry -- not just headphone stands.  Iteratively
-    removes low-stress material while preserving structural integrity.
+    Works with any STL geometry.  Iteratively removes low-stress material
+    while preserving structural integrity.
 
     Parameters
     ----------
@@ -288,13 +294,13 @@ def run_topopt(
 
         _render_to_file(out_stl_path, out_png_path)
 
-        # physics checks: disc_base only (tipping + stem bending)
+        # physics checks: disc_base only (tipping + cantilever bending)
         if ft == "disc_base":
-            reach = float(np.sqrt(load_point_x_mm**2 + load_point_y_mm**2))
+            offset = float(np.sqrt(load_point_x_mm**2 + load_point_y_mm**2))
             physics = _physics_checks(
                 stl_path=str(out_stl_path),
                 load_mass_g=load_mass_g,
-                arm_reach_mm=reach,
+                load_offset_mm=offset,
                 base_radius_mm=base_radius_mm,
             )
         else:
@@ -325,26 +331,27 @@ def run_topopt(
 def check_physics(
     stl_path: str,
     load_mass_g: float,
-    arm_reach_mm: float,
+    load_offset_mm: float,
     base_radius_mm: float = 48.0,
-    stem_min_radius_mm: float = 7.0,
+    min_section_radius_mm: float = 7.0,
     infill_percent: float = 20.0,
     material_density_g_cm3: float = 1.24,
     material_yield_mpa: float = 55.0,
 ) -> dict:
     """Run structural physics checks on an STL file.
 
-    Evaluates tipping stability and stem bending stress at the given
-    operating load.  Returns safety factors and pass/fail per check.
+    Evaluates tipping stability and cantilever bending stress at the
+    narrowest cross-section under the given operating load.  Returns
+    safety factors and pass/fail per check.
 
     Parameters
     ----------
     stl_path              : STL to evaluate (absolute or project-relative).
     load_mass_g           : Operating load [g] (not factored).
-    arm_reach_mm          : Horizontal distance from base axis to load [mm].
+    load_offset_mm        : Horizontal distance from base axis to load [mm].
     base_radius_mm        : Base disc radius [mm].
-    stem_min_radius_mm    : Radius at narrowest stem cross-section [mm].
-    infill_percent        : FDM infill % -- affects stand mass (default 20).
+    min_section_radius_mm : Radius at narrowest cross-section [mm].
+    infill_percent        : FDM infill % -- affects part mass (default 20).
     material_density_g_cm3: Raw filament density [g/cm3] (PLA: 1.24).
     material_yield_mpa    : Filament yield strength [MPa] (PLA: 55).
     """
@@ -352,9 +359,9 @@ def check_physics(
     return _physics_checks(
         stl_path=str(stl_p),
         load_mass_g=load_mass_g,
-        arm_reach_mm=arm_reach_mm,
+        load_offset_mm=load_offset_mm,
         base_radius_mm=base_radius_mm,
-        stem_min_radius_mm=stem_min_radius_mm,
+        min_section_radius_mm=min_section_radius_mm,
         infill_percent=infill_percent,
         material_density_g_cm3=material_density_g_cm3,
         material_yield_mpa=material_yield_mpa,
@@ -362,84 +369,7 @@ def check_physics(
 
 
 # ===========================================================================
-# Tool 3 -- parametric base-design generator
-# ===========================================================================
-
-@mcp.tool()
-def generate_holder(
-    base_radius_mm:      float = 48.0,
-    base_height_mm:      float = 14.0,
-    stem_height_mm:      float = 234.0,
-    stem_radius_base_mm: float = 9.0,
-    stem_radius_top_mm:  float = 7.0,
-    arm_reach_mm:        float = 82.0,
-    arm_tip_z_mm:        float = 244.0,
-    arm_radius_mm:       float = 8.5,
-    end_cap_radius_mm:   float = 9.0,
-    resolution_mm:       float = 1.0,
-    out_stl: Optional[str] = None,
-) -> dict:
-    """Generate a parametric headphone-holder STL from design parameters.
-
-    Builds the full holder geometry (base disc + tapered stem + S-curve arm
-    + end cap) via a signed-distance-field union and scikit-image marching
-    cubes.  No picogk / external CAD kernel required.
-
-    The returned dict contains arm_tip_x/y/z_mm and base_radius_mm ready
-    to pass directly into run_topopt or check_physics.
-
-    Parameters
-    ----------
-    base_radius_mm      : Base disc radius [mm].  Larger = more stable.
-    base_height_mm      : Base disc thickness [mm].
-    stem_height_mm      : Height where the arm leaves the stem [mm].
-                          Total stand height is roughly stem_height_mm + 20.
-    stem_radius_base_mm : Stem radius at the base junction [mm].
-    stem_radius_top_mm  : Stem radius at the top junction [mm] (taper).
-    arm_reach_mm        : Horizontal reach of the hook tip [mm].
-    arm_tip_z_mm        : Z-height of the hook tip [mm].
-    arm_radius_mm       : Arm beam radius [mm].
-    end_cap_radius_mm   : End-cap sphere radius [mm].
-    resolution_mm       : SDF grid pitch [mm].  1 mm is a good balance
-                          (~5 s); use 0.5 for a finer mesh (~40 s).
-    out_stl             : Output path.  Default: docs/generated_holder.stl
-    """
-    from picogk_mp.generators.holder import generate_holder_stl
-
-    if out_stl is not None:
-        out_path = Path(out_stl) if Path(out_stl).is_absolute() else ROOT / out_stl
-    else:
-        out_path = DOCS / "generated_holder.stl"
-
-    try:
-        result = generate_holder_stl(
-            base_radius_mm      = base_radius_mm,
-            base_height_mm      = base_height_mm,
-            stem_height_mm      = stem_height_mm,
-            stem_radius_base_mm = stem_radius_base_mm,
-            stem_radius_top_mm  = stem_radius_top_mm,
-            arm_reach_mm        = arm_reach_mm,
-            arm_tip_z_mm        = arm_tip_z_mm,
-            arm_radius_mm       = arm_radius_mm,
-            end_cap_radius_mm   = end_cap_radius_mm,
-            resolution_mm       = resolution_mm,
-            out_stl             = str(out_path),
-        )
-
-        # Render preview
-        png_path = out_path.with_suffix(".png")
-        _render_to_file(out_path, png_path)
-        result["png_path"] = str(png_path)
-
-        return result
-
-    except Exception:
-        import traceback
-        return {"status": "error", "message": traceback.format_exc()}
-
-
-# ===========================================================================
-# Tool 5 -- render STL -> PNG (returned inline)
+# Tool -- render STL -> PNG (returned inline)
 # ===========================================================================
 
 @mcp.tool()
@@ -879,15 +809,15 @@ def run_cfd_thermal(
 def _physics_checks(
     stl_path: str,
     load_mass_g: float,
-    arm_reach_mm: float,
+    load_offset_mm: float,
     base_radius_mm: float = 48.0,
-    stem_min_radius_mm: float = 7.0,
+    min_section_radius_mm: float = 7.0,
     infill_percent: float = 20.0,
     material_density_g_cm3: float = 1.24,
     material_yield_mpa: float = 55.0,
 ) -> dict:
     import trimesh
-    from picogk_mp.physics.checks import TippingCheck, StemBendingCheck
+    from picogk_mp.physics.checks import TippingCheck, CantileverBendingCheck
 
     try:
         mesh = trimesh.load(str(stl_path), force="mesh")
@@ -896,19 +826,19 @@ def _physics_checks(
         return {"status": "error", "message": f"Cannot load STL: {exc}"}
 
     ctx = {
-        "head_mass_g":    load_mass_g,
-        "base_r_mm":      base_radius_mm,
-        "arm_reach_mm":   arm_reach_mm,
-        "volume_mm3":     volume_mm3,
-        "infill_pct":     infill_percent,
-        "density_g_cm3":  material_density_g_cm3,
-        "stem_r_min_mm":  stem_min_radius_mm,
-        "yield_mpa":      material_yield_mpa,
+        "load_mass_g":           load_mass_g,
+        "base_r_mm":             base_radius_mm,
+        "load_offset_mm":        load_offset_mm,
+        "volume_mm3":            volume_mm3,
+        "infill_pct":            infill_percent,
+        "density_g_cm3":         material_density_g_cm3,
+        "min_section_radius_mm": min_section_radius_mm,
+        "yield_mpa":             material_yield_mpa,
     }
 
     checks_out: dict = {}
     all_passed = True
-    for check in [TippingCheck(), StemBendingCheck()]:
+    for check in [TippingCheck(), CantileverBendingCheck()]:
         r = check.evaluate(ctx)
         checks_out[check.name] = {
             "passed":      r.passed,
@@ -923,7 +853,7 @@ def _physics_checks(
         "status":      "ok",
         "all_passed":  all_passed,
         "volume_mm3":  round(volume_mm3),
-        "stand_mass_g": round(volume_mm3 * (infill_percent / 100)
+        "part_mass_g": round(volume_mm3 * (infill_percent / 100)
                               * material_density_g_cm3 / 1000, 1),
         "checks":      checks_out,
     }

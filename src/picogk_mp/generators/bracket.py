@@ -36,7 +36,7 @@ import trimesh
 
 
 # ---------------------------------------------------------------------------
-# SDF primitives (re-used from holder.py pattern)
+# SDF primitives
 # ---------------------------------------------------------------------------
 
 def _sdf_box(pts: np.ndarray,

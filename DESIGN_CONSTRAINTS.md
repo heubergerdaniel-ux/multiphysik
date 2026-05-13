@@ -21,7 +21,7 @@ Alle Entwürfe MÜSSEN diese Bedingungen erfüllen, bevor ein STL exportiert wir
 | Bruch/Versagen unter Spitzenlast | ≥ 5.0 |
 
 ### Standardlasten (falls nicht anders angegeben)
-- Kopfhörer: 400 g am Arm-Endpunkt
+- Punktlast `M_load` [g] am horizontalen Versatz `L_offset` [mm] vom Basis-Achse
 - Dynamischer Lastfaktor (Anstoßen, Ablegen): 2.0 × statische Last
 
 ---
@@ -31,34 +31,20 @@ Alle Entwürfe MÜSSEN diese Bedingungen erfüllen, bevor ein STL exportiert wir
 Vor jedem STL-Export analytisch prüfen:
 
 ```
-lever_head  = arm_reach - base_r          [mm]  -- Kipphebelarm Last
-lever_stand = base_r - |CG_x|             [mm]  -- Gegenhebelarm Ständer
-tip_moment  = head_mass * lever_head      [g·mm]
-restore     = stand_mass * lever_stand    [g·mm]
-SF_tip      = restore / tip_moment        [-]   -- muss ≥ 1.5 sein
+lever_load  = L_offset - base_r          [mm]  -- Kipphebelarm Last
+lever_part  = base_r - |CG_x|            [mm]  -- Gegenhebelarm Bauteil
+tip_moment  = M_load    * lever_load     [g·mm]
+restore     = M_part    * lever_part     [g·mm]
+SF_tip      = restore / tip_moment       [-]   -- muss ≥ 1.5 sein
 ```
 
-**Bei SF < 1.5: Design ablehnen und Parameter anpassen (base_r, arm_reach, Wandstärke).**
+**Bei SF < 1.5: Design ablehnen und Parameter anpassen (base_r, L_offset, Wandstärke).**
 
 Mindest-Basisradius-Formel (direkt lösbar):
 
 ```
-base_r_min = (head_mass * safety * arm_reach) / (stand_mass + head_mass * safety)
+base_r_min = (M_load * safety * L_offset) / (M_part + M_load * safety)
 ```
-
----
-
-## Geometrische Randbedingungen (Kopfhörerhalter-Referenz)
-
-Gilt für alle Kopfhörerhalter-Varianten als Ausgangspunkt:
-
-| Parameter | Minimum | Referenz | Maximum |
-|---|---|---|---|
-| Gesamthöhe | 220 mm | 255 mm | 320 mm |
-| Basis-Radius | 65 mm | 95 mm | 130 mm |
-| Basis-Höhe | 10 mm | 16 mm | 25 mm |
-| Arm-Reichweite (horizontal) | 60 mm | 80 mm | 100 mm |
-| Stem-Durchmesser (Fuß) | 10 mm | 12 mm | 18 mm |
 
 ---
 
@@ -86,3 +72,23 @@ Gilt für alle Kopfhörerhalter-Varianten als Ausgangspunkt:
 - Windows 11 Pro, PowerShell, .NET SDK 8.0.420
 - Import: `import picogk` (NICHT `pycogk`)
 - Bool-Ops in-place: immer `a.duplicate().bool_add(b)` verwenden
+
+---
+
+## Anhang — Referenzdesign: Kopfhörerhalter
+
+Ein worked example der Pipeline mit konkreten Zahlen. Andere Designs
+können andere Zahlen verwenden — die Formeln und SF-Schwellen oben gelten generisch.
+
+**Standardlast:** `M_load = 400 g` am Arm-Endpunkt.
+
+| Parameter | Minimum | Referenz | Maximum |
+|---|---|---|---|
+| Gesamthöhe | 220 mm | 255 mm | 320 mm |
+| Basis-Radius `base_r` | 65 mm | 95 mm | 130 mm |
+| Basis-Höhe | 10 mm | 16 mm | 25 mm |
+| Lastversatz `L_offset` (horizontal) | 60 mm | 80 mm | 100 mm |
+| Min. Querschnittsradius (Stem-Fuß) | 10 mm | 12 mm | 18 mm |
+
+Code-Referenz: [examples/03_headphone_holder.py](examples/03_headphone_holder.py),
+[examples/04_topopt_holder.py](examples/04_topopt_holder.py).

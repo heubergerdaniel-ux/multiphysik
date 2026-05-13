@@ -20,16 +20,16 @@ Usage::
     from picogk_mp.topopt.boundary import BoundaryConditions
 
     pipeline = TopoptPipeline(
-        stl_path="tests/fixtures/headphone_holder_v2.stl",
+        stl_path="part.stl",
         topopt_h_mm=3.0,
         vol_frac=0.40,
         max_iter=40,
     )
-    bc = BoundaryConditions.headphone_holder(
+    bc = BoundaryConditions.disc_base_with_tip_load(
         *pipeline.grid_shape, pipeline.h, pipeline.offset,
-        base_radius_mm=48, arm_tip_mm=(-82, 0, 244), head_mass_g=400,
+        base_radius_mm=48, load_point_mm=(-82, 0, 244), load_mass_g=400,
     )
-    result_stl = pipeline.run(bc, out_stl="docs/holder_optimised.stl")
+    result_stl = pipeline.run(bc, out_stl="docs/optimised.stl")
 """
 from __future__ import annotations
 

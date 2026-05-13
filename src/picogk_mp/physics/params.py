@@ -5,7 +5,7 @@ Until then it is UNKNOWN and the engine will ask the user for it.
 
 Usage::
 
-    p = Param("head_mass_g", "Kopfhoerermasse", unit="g", lo=50, hi=1000)
+    p = Param("load_mass_g", "Lastmasse", unit="g", lo=50, hi=1000)
     p.is_resolved   # False -- must be queried
     p.set(350.0)
     p.resolved_value  # 350.0

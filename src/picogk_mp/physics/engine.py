@@ -3,7 +3,7 @@
 Workflow
 --------
 1. Register Param objects (some known, some unknown).
-2. Register checks (TippingCheck, StemBendingCheck, ...).
+2. Register checks (TippingCheck, CantileverBendingCheck, ...).
 3. Call engine.inject(**geometry_values) to push in computed geometry.
 4. Call engine.run():
       a. For each unresolved Param:  ask user via CLI (or use resolver).
@@ -16,13 +16,13 @@ Non-interactive mode (tests, CI)
 Pass a *resolver* callable to the constructor::
 
     def my_resolver(param: Param):
-        return {"head_mass_g": 400, "infill_pct": 15}[param.key]
+        return {"load_mass_g": 400, "infill_pct": 15}[param.key]
 
     engine = SimEngine(resolver=my_resolver)
 
 Or pass a plain dict shorthand::
 
-    engine = SimEngine(resolver={"head_mass_g": 400})
+    engine = SimEngine(resolver={"load_mass_g": 400})
 """
 from __future__ import annotations
 

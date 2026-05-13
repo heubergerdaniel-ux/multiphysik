@@ -155,29 +155,32 @@ class BoundaryConditions:
     force_vec:  np.ndarray      # (ndof,) float64 force vector
 
     @classmethod
-    def headphone_holder(
+    def disc_base_with_tip_load(
         cls,
         Nx: int, Ny: int, Nz: int,
         h: float,
         offset: Sequence[float],
         base_radius_mm: float,
-        arm_tip_mm: Sequence[float],
-        head_mass_g: float,
+        load_point_mm: Sequence[float],
+        load_mass_g: float,
     ) -> "BoundaryConditions":
-        """Standard BCs for a headphone holder standing on its base.
+        """BCs for a disc-base fixture with a vertical point load at offset.
 
-        Fixed: all nodes on z=0 within base_radius (clamped disc base).
-        Load:  vertical gravity load at arm tip node (downward z).
+        Fixed: all z=0 nodes within base_radius (clamped disc base).
+        Load:  vertical gravity load (downward z) at load_point_mm.
+
+        Applies to any standing or cantilevered part with a disc base:
+        stands, posts, brackets, fixtures, tool holders, etc.
         """
         g_ms2  = 9.81
-        F_N    = head_mass_g * 1e-3 * g_ms2          # [N] downward
+        F_N    = load_mass_g * 1e-3 * g_ms2          # [N] downward
 
         fixed = fixed_cylinder_base_dofs(
             Nx, Ny, Nz, h, offset, base_radius_mm,
         )
         f = point_load_dof(
             Nx, Ny, Nz, h, offset,
-            position_mm=arm_tip_mm,
+            position_mm=load_point_mm,
             force_N=(0.0, 0.0, -F_N),
         )
         ndof_expected = 3 * (Nx + 1) * (Ny + 1) * (Nz + 1)

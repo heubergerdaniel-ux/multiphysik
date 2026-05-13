@@ -307,18 +307,17 @@ class TestBoundaryConditions:
         f2 = f.copy(); f2[3*n:3*n+3] = 0.0
         assert np.allclose(f2, 0.0)
 
-    def test_headphone_holder_bc(self):
-        # Grid must cover the cylinder axis (x=0,y=0) and the arm tip.
+    def test_disc_base_with_tip_load_bc(self):
+        # Grid must cover the cylinder axis (x=0,y=0) and the load point.
         # offset=(-91,-48,0), h=3 -> axis at ix=91/3~30, iy=48/3=16
-        # Use a grid large enough: Nx=47, Ny=32, Nz=87 matches real holder.
         h = 3.0
         Nx, Ny, Nz = 47, 32, 87
         offset = (-91.0, -48.0, 0.0)
-        bc = BoundaryConditions.headphone_holder(
+        bc = BoundaryConditions.disc_base_with_tip_load(
             Nx, Ny, Nz, h, offset,
             base_radius_mm=48.0,
-            arm_tip_mm=(-82.0, 0.0, 244.0),
-            head_mass_g=400.0,
+            load_point_mm=(-82.0, 0.0, 244.0),
+            load_mass_g=400.0,
         )
         ndof = 3 * (Nx+1) * (Ny+1) * (Nz+1)
         assert bc.force_vec.shape == (ndof,)
